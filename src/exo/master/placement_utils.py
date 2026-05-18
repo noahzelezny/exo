@@ -1,3 +1,4 @@
+import os
 from collections.abc import Generator, Mapping
 
 from loguru import logger
@@ -365,6 +366,26 @@ def find_ip_prioritised(
             "wifi": 3,
             "unknown": 4,
         }
+        # Scout patch 2026-05-14: macOS presents IP-over-Thunderbolt as a
+        # plain ethernet-class interface ("maybe_ethernet"), so the real
+        # point-to-point TB4 link ties in priority with a home-LAN
+        # ethernet port. min() then breaks the tie by list order and
+        # frequently splits the ring across mixed networks (one leg TB4,
+        # one leg home LAN / WiFi). A ring runs at its slowest leg, so
+        # that tanks pipeline-parallel inference (observed: 35s prefill)
+        # and trips the macOS GPU command-buffer watchdog mid-decode,
+        # SIGABRT-ing the runner. RDMA (MlxJaccl) is the "real" fix but
+        # is unreliable on this cluster due to asymmetric M3/M4 compute
+        # speeds (race conditions), so we pin every ring leg to the known
+        # point-to-point TB4 subnet instead. Override the prefix via the
+        # EXO_RING_PREFER_SUBNET env var.
+        _tb_subnet = os.environ.get("EXO_RING_PREFER_SUBNET", "10.0.0.")
+        return min(
+            ips,
+            key=lambda ip: -1
+            if ip.startswith(_tb_subnet)
+            else priority.get(ip_to_type.get(ip, "unknown"), 2),
+        )
 
     # RDMA prefers ethernet coordinator
     else:

@@ -1,3 +1,4 @@
+import os
 import shutil
 from collections.abc import Sequence
 from pathlib import Path
@@ -49,7 +50,7 @@ class DiskUsage(FrozenModel):
     @classmethod
     def from_path(cls, path: Path) -> Self:
         """Get disk usage stats for the partition containing path."""
-        total, _used, free = shutil.disk_usage(path)
+        total, _used, free = shutil.disk_usage(os.path.realpath(path))
         return cls(
             total=Memory.from_bytes(total),
             available=Memory.from_bytes(free),
