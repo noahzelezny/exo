@@ -28,7 +28,12 @@ _RING_TRANSPORT_ABORT_RE = re.compile(
 
 class BaseRunnerDiagnostic(TaggedModel):
     message: str
-    evidence: tuple[str, ...] = ()
+    # Scout patch 2026-05-18: was `tuple[str, ...] = ()`. JSON has no tuple,
+    # only list, and FrozenModel.model_config has strict=True — so the wire
+    # form (list) failed to validate as tuple, killing the master with a
+    # 70-error pydantic cascade on any RunnerFailed event whose stderr
+    # matched a known diagnostic regex. See Scout/exo.log 2026-05-18 16:35.
+    evidence: list[str] = []
 
 
 class RunnerMetalGpuTimeout(BaseRunnerDiagnostic):
@@ -67,7 +72,7 @@ class RunnerDiagnosticCollector:
             return
 
         self._stderr_tail.append(line)
-        evidence = tuple(self._stderr_tail)
+        evidence: list[str] = list(self._stderr_tail)
         diagnostic = self._classify_line(line, evidence) or RunnerUnknown(
             message="Unclassified runner stderr line",
             evidence=evidence,
@@ -91,7 +96,7 @@ class RunnerDiagnosticCollector:
         return tuple(self._diagnostics)
 
     def _classify_line(
-        self, line: str, evidence: tuple[str, ...]
+        self, line: str, evidence: list[str]
     ) -> KnownRunnerDiagnostic | None:
         if metal_error := _parse_metal_gpu_timeout(line, evidence):
             return metal_error
@@ -109,7 +114,7 @@ class RunnerDiagnosticCollector:
 
 
 def _parse_metal_gpu_timeout(
-    line: str, evidence: tuple[str, ...]
+    line: str, evidence: list[str]
 ) -> RunnerMetalGpuTimeout | None:
     match = _METAL_GPU_TIMEOUT_RE.match(line)
     if match is None:
@@ -122,7 +127,7 @@ def _parse_metal_gpu_timeout(
 
 
 def _parse_ring_socket_error(
-    line: str, evidence: tuple[str, ...]
+    line: str, evidence: list[str]
 ) -> RunnerRingSocketReceivingError | None:
     match = _RING_SOCKET_ERRNO_RE.match(line)
     if match is None:
