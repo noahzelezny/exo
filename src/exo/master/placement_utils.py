@@ -350,7 +350,19 @@ def find_ip_prioritised(
     """
     ips = list(_find_connection_ip(node_id, other_node_id, cycle_digraph))
     if not ips:
-        return None
+        # Scout patch 2026-05-18: exo's topology probe is asymmetric in this
+        # cluster — A→B socket connections populate but B→A only has an RDMA
+        # edge (no SocketConnection), even though HTTP is reachable both
+        # ways. _find_connection_ip filters for SocketConnection so it
+        # returns empty for one direction and placement fails. Fall back to
+        # the peer's NodeNetworkInfo interfaces — those describe every IP
+        # the peer is listening on (collected by exo via a separate path
+        # that does work bidirectionally). The TB4-subnet priority below
+        # still picks the right leg.
+        fallback = node_network.get(other_node_id, NodeNetworkInfo())
+        ips = [iface.ip_address for iface in fallback.interfaces]
+        if not ips:
+            return None
     other_network = node_network.get(other_node_id, NodeNetworkInfo())
     ip_to_type = {
         iface.ip_address: iface.interface_type for iface in other_network.interfaces

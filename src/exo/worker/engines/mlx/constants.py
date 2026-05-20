@@ -10,7 +10,7 @@ KV_GROUP_SIZE: int | None = 32
 # regardless of how it was created — this is the knob that actually
 # affects make_cache models like Qwen3.5. 8-bit ~halves KV memory at
 # negligible quality cost.
-KV_BITS: int | None = 8
+KV_BITS: int | None = None
 ATTENTION_KV_BITS: int | None = 4
 MAX_TOKENS: int = 32168
 MAX_KV_SIZE: int | None = 3200
@@ -19,7 +19,7 @@ QUANTIZE_MODEL_MODE: str | None = "affine"
 CACHE_GROUP_SIZE: int = 64
 # Scout patch 2026-05-14: also quantize at cache-creation time for models
 # that go through exo's own make_kv_cache path (non-make_cache models).
-KV_CACHE_BITS: int | None = 8
+KV_CACHE_BITS: int | None = None
 
 DEFAULT_TOP_LOGPROBS: int = 5
 
