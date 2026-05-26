@@ -347,15 +347,23 @@ async def fetch_config_data(model_id: ModelId) -> ConfigData:
     )
 
     target_dir = await resolve_model_dir(model_id)
-    config_path = await download_file_with_retry(
-        model_id,
-        "main",
-        "config.json",
-        target_dir,
-        lambda curr_bytes, total_bytes, is_renamed: logger.debug(
-            f"Downloading config.json for {model_id}: {curr_bytes}/{total_bytes} ({is_renamed=})"
-        ),
-    )
+    # Trust an already-staged local config.json rather than re-downloading it
+    # (same rationale as the index: a locally-corrected config — e.g. fixing a
+    # field type mismatch against the installed transformers — must survive
+    # exo's size-mismatch re-download in offline operation).
+    local_config = target_dir / "config.json"
+    if await aios.path.exists(local_config):
+        config_path = local_config
+    else:
+        config_path = await download_file_with_retry(
+            model_id,
+            "main",
+            "config.json",
+            target_dir,
+            lambda curr_bytes, total_bytes, is_renamed: logger.debug(
+                f"Downloading config.json for {model_id}: {curr_bytes}/{total_bytes} ({is_renamed=})"
+            ),
+        )
     async with aiofiles.open(config_path, "r") as f:
         return ConfigData.model_validate_json(
             await f.read(), context={"model_id": str(model_id)}
@@ -371,15 +379,25 @@ async def fetch_safetensors_size(model_id: ModelId) -> Memory:
     from exo.shared.types.worker.downloads import ModelSafetensorsIndex
 
     target_dir = await resolve_model_dir(model_id)
-    index_path = await download_file_with_retry(
-        model_id,
-        "main",
-        "model.safetensors.index.json",
-        target_dir,
-        lambda curr_bytes, total_bytes, is_renamed: logger.debug(
-            f"Downloading model.safetensors.index.json for {model_id}: {curr_bytes}/{total_bytes} ({is_renamed=})"
-        ),
-    )
+    # Trust an already-staged local index instead of re-downloading it. exo's
+    # downloader verifies every file against HF and deletes + re-fetches the
+    # index on any size mismatch — which clobbers a locally-corrected index.
+    # Some mlx-community repos ship an index.json copied from a different
+    # variant (wrong total_size + shard list); in offline/air-gapped operation
+    # the local corrected copy must win. Only fetch when no local index exists.
+    local_index = target_dir / "model.safetensors.index.json"
+    if await aios.path.exists(local_index):
+        index_path = local_index
+    else:
+        index_path = await download_file_with_retry(
+            model_id,
+            "main",
+            "model.safetensors.index.json",
+            target_dir,
+            lambda curr_bytes, total_bytes, is_renamed: logger.debug(
+                f"Downloading model.safetensors.index.json for {model_id}: {curr_bytes}/{total_bytes} ({is_renamed=})"
+            ),
+        )
     async with aiofiles.open(index_path, "r") as f:
         index_data = ModelSafetensorsIndex.model_validate_json(await f.read())
 
