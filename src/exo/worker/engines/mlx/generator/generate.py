@@ -54,6 +54,7 @@ from exo.worker.engines.mlx.constants import (
     KV_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
+    kv_bits_for,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -288,6 +289,7 @@ def prefill(
     group: mx.distributed.Group | None,
     on_prefill_progress: Callable[[int, int], None] | None,
     distributed_prompt_progress_callback: Callable[[], None] | None,
+    kv_bits: int | None = None,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
@@ -343,7 +345,7 @@ def prefill(
                 prompt_cache=cache,
                 prefill_step_size=prefill_step_size,
                 kv_group_size=KV_GROUP_SIZE,
-                kv_bits=KV_BITS,
+                kv_bits=kv_bits,
                 prompt_progress_callback=progress_callback,
                 distributed_prompt_progress_callback=distributed_prompt_progress_callback,
                 group=group,
@@ -360,7 +362,7 @@ def prefill(
                 prompt_cache=cache,
                 prefill_step_size=prefill_step_size,
                 kv_group_size=KV_GROUP_SIZE,
-                kv_bits=KV_BITS,
+                kv_bits=kv_bits,
                 prompt_progress_callback=combined_progress_callback,
             ):
                 break  # Stop after first iteration - cache is now filled
@@ -547,6 +549,12 @@ def mlx_generate(
     seed = task.seed or 42
     mx.random.seed(seed)
 
+    # Per-model KV cache quantization override. See `kv_bits_for` in
+    # ../constants.py for the architecture-quirk-driven decision table.
+    # Resolved here (once per request) and threaded down to both prefill
+    # and decode so the entire request runs at the same KV precision.
+    kv_bits = kv_bits_for(task.model)
+
     # Encode prompt once at the top and fix unmatched think tags
     all_prompt_tokens = encode_prompt(tokenizer, prompt)
     all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
@@ -672,6 +680,7 @@ def mlx_generate(
                 group,
                 on_prefill_progress,
                 distributed_prompt_progress_callback,
+                kv_bits=kv_bits,
             )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 
@@ -728,7 +737,7 @@ def mlx_generate(
             prompt_cache=caches,
             prefill_step_size=1,
             kv_group_size=KV_GROUP_SIZE,
-            kv_bits=KV_BITS,
+            kv_bits=kv_bits,
         ),
         start=1,
     ):
