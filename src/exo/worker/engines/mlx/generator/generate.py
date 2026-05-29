@@ -554,6 +554,12 @@ def mlx_generate(
     # Resolved here (once per request) and threaded down to both prefill
     # and decode so the entire request runs at the same KV precision.
     kv_bits = kv_bits_for(task.model)
+    # Permanent observability: log resolved precision per request so we can
+    # verify the gating fires for whitelisted models, and so it's obvious
+    # when an unknown model falls through to the FP16 default. Cheap (one
+    # line per chat completion) and pays for itself the next time anyone
+    # debugs an OOM or gibberish issue.
+    logger.info(f"kv_bits resolved for model={task.model}: {kv_bits}")
 
     # Encode prompt once at the top and fix unmatched think tags
     all_prompt_tokens = encode_prompt(tokenizer, prompt)
