@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import math
+import os
 import time
 import uuid
 from typing import Callable, Generator, cast, get_args
@@ -333,7 +334,14 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    # Scout 2026-06-10: the prefill chunk size sets the PEAK prefill activation
+    # memory (≈ chunk_size × seq_len × heads), the transient that OOMs DeepSeek
+    # -V4-Flash on long prefills on the tight M3+M4 ring (144GB weights / 224GB
+    # RAM → ~8k-token ceiling: it hangs then the OS memory-kills the instance).
+    # Lowering this shrinks the spike so V4 survives much longer contexts
+    # (slower prefill — more chunks — but works at all). Env-tunable; the 4096
+    # default preserves upstream behavior until EXO_PREFILL_STEP_SIZE is set.
+    prefill_step_size = int(os.getenv("EXO_PREFILL_STEP_SIZE", "4096"))
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
