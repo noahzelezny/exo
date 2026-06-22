@@ -408,7 +408,23 @@ def find_ip_prioritised(
             "maybe_ethernet": 3,
             "thunderbolt": 4,
         }
-    return min(ips, key=lambda ip: priority.get(ip_to_type.get(ip, "unknown"), 2))
+    # Scout patch 2026-06-22: on this cluster the "ethernet" coordinator leg is
+    # M4's home-LAN port behind a 10G splitter + USB-C hub — measured 4.3ms /
+    # 0.33ms jitter, SHARED with all home-network traffic, vs the TB4 bridge's
+    # 0.43ms / 0.06ms on a dedicated point-to-point cable. So the lightweight
+    # rendezvous/gossip used to ride the splitter and was exposed to network
+    # contention. Pin the coordinator to the same TB4 subnet the ring already
+    # uses (EXO_RING_PREFER_SUBNET) so it rides the dedicated link instead. That
+    # subnet (10.0.0.x, en4/en3) is SEPARATE from the raw RDMA ifaces (10.0.1.x,
+    # en7/en2), so this keeps the coordinator off the RDMA link too — honoring
+    # the ethernet-coordinator intent while dropping the home-LAN dependency.
+    _tb_subnet = os.environ.get("EXO_RING_PREFER_SUBNET", "10.0.0.")
+    return min(
+        ips,
+        key=lambda ip: -1
+        if ip.startswith(_tb_subnet)
+        else priority.get(ip_to_type.get(ip, "unknown"), 2),
+    )
 
 
 def get_mlx_ring_hosts_by_node(
