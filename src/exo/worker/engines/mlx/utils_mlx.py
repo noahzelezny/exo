@@ -283,6 +283,23 @@ def shard_and_load(
     # Synchronize processes before generation to avoid timeout
     mx_barrier(group)
 
+    # Scout 2026-06-22: phase-aware C1 jaccl ring self-heal — ARM the decode
+    # deadline HERE and only here. Load is complete and the final barrier has
+    # returned, so this point is quiescent (no collective in flight) — the one safe
+    # instant to flip JACCL_COLLECTIVE_TIMEOUT_MS without a getenv/setenv race. The
+    # deadline MUST be 0 during load (the load barrier legitimately stalls >30s
+    # while a peer streams its shard — arming it then throws a false "ring wedged"
+    # and aborts placement). Now decode collectives finish in ms, so a small
+    # deadline catches a real wedge fast. Requires the live-getenv mlx (jaccl reads
+    # the env per collective). Off unless EXO_JACCL_DECODE_TIMEOUT_MS > 0.
+    _decode_timeout = os.environ.get("EXO_JACCL_DECODE_TIMEOUT_MS", "0")
+    try:
+        if int(_decode_timeout) > 0:
+            os.environ["JACCL_COLLECTIVE_TIMEOUT_MS"] = _decode_timeout
+            logger.info(f"Armed jaccl decode deadline: {_decode_timeout}ms (was 0 for load)")
+    except ValueError:
+        logger.warning(f"Ignoring non-integer EXO_JACCL_DECODE_TIMEOUT_MS={_decode_timeout!r}")
+
     return model, tokenizer
 
 
