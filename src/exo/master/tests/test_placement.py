@@ -1056,3 +1056,109 @@ def test_mlx_jaccl_rejects_cuda_only_cycle(model_card: ModelCard):
             node_backends,
             node_rdma_ctl=node_rdma_ctl,
         )
+
+
+def _build_two_node_rdma_topology() -> tuple[
+    Topology, NodeId, NodeId, dict[NodeId, NodeNetworkInfo]
+]:
+    topology = Topology()
+    node_a = NodeId()
+    node_b = NodeId()
+    node_network = {node_a: create_node_network(), node_b: create_node_network()}
+    for n in (node_a, node_b):
+        topology.add_node(n)
+    for src, sink in ((node_a, node_b), (node_b, node_a)):
+        topology.add_connection(
+            Connection(source=src, sink=sink, edge=create_rdma_connection(3))
+        )
+    return topology, node_a, node_b, node_network
+
+
+def _device_rank(instance: MlxJacclInstance, node_id: NodeId) -> int:
+    runner_id = instance.shard_assignments.node_to_runner[node_id]
+    return instance.shard_assignments.runner_to_shard[runner_id].device_rank
+
+
+@pytest.mark.parametrize("master_is", ["a", "b"])
+def test_prefer_master_rank0_pins_master_when_enabled(
+    model_card: ModelCard, monkeypatch: pytest.MonkeyPatch, master_is: str
+):
+    """With EXO_TENSOR_PREFER_MASTER_RANK0=1, the master node is device_rank 0
+    regardless of the (non-deterministic) cycle order — for either node as
+    master, proving it's the rotation, not luck."""
+    monkeypatch.setenv("EXO_TENSOR_PREFER_MASTER_RANK0", "1")
+    topology, node_a, node_b, node_network = _build_two_node_rdma_topology()
+    node_memory = {node_a: create_node_memory(500), node_b: create_node_memory(500)}
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+    }
+    master = node_a if master_is == "a" else node_b
+    other = node_b if master_is == "a" else node_a
+
+    cic = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card.model_copy(
+            update={"n_layers": 12, "storage_size": Memory.from_bytes(1000)}
+        ),
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        node_rdma_ctl=node_rdma_ctl,
+        master_node_id=master,
+    )
+
+    instance = list(placements.values())[0]
+    assert isinstance(instance, MlxJacclInstance)
+    assert _device_rank(instance, master) == 0
+    assert _device_rank(instance, other) == 1
+
+
+def test_prefer_master_rank0_is_noop_when_disabled(
+    model_card: ModelCard, monkeypatch: pytest.MonkeyPatch
+):
+    """Default (flag unset): passing master_node_id must NOT force a rank — the
+    knob is strictly opt-in, so placement is byte-for-byte the upstream path."""
+    monkeypatch.delenv("EXO_TENSOR_PREFER_MASTER_RANK0", raising=False)
+    topology, node_a, node_b, node_network = _build_two_node_rdma_topology()
+    node_memory = {node_a: create_node_memory(500), node_b: create_node_memory(500)}
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+    }
+    cic = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card.model_copy(
+            update={"n_layers": 12, "storage_size": Memory.from_bytes(1000)}
+        ),
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        cic,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        node_rdma_ctl=node_rdma_ctl,
+        master_node_id=node_a,
+    )
+
+    instance = list(placements.values())[0]
+    assert isinstance(instance, MlxJacclInstance)
+    # Both ranks present and distinct; we assert nothing about WHICH node is 0
+    # (that's the upstream non-deterministic behavior we deliberately preserve).
+    ranks = {_device_rank(instance, node_a), _device_rank(instance, node_b)}
+    assert ranks == {0, 1}

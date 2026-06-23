@@ -1,6 +1,9 @@
+import os
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Sequence
+
+from loguru import logger
 
 from exo.master.placement_utils import (
     Cycle,
@@ -113,6 +116,7 @@ def place_instance(
     required_nodes: set[NodeId] | None = None,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] | None = None,
+    master_node_id: NodeId | None = None,
 ) -> dict[InstanceId, Instance]:
     cycles = topology.get_cycles()
     candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
@@ -241,6 +245,36 @@ def place_instance(
             ),
         ),
     )
+
+    # Scout: optionally pin the elected master as tensor rank 0. device_rank is
+    # the cycle index (see get_shard_assignments_for_tensor_parallel), and the
+    # rank-0 node becomes the jaccl coordinator / all-reduce origin (below), so
+    # rotating the cycle to start at the master makes it rank 0. We ROTATE (not
+    # arbitrary reorder) so ring adjacency is preserved for >2-node cycles.
+    # Opt-in and a no-op by default: node-ids are ephemeral (the keypair is
+    # regenerated every boot — node-id persistence is currently disabled
+    # upstream), so "the master" is the only stable handle to a specific node.
+    # Measured on the M3+M4 rig: M3-as-rank0 ~33 tok/s vs M4-as-rank0 ~29 (the
+    # M3 Ultra has the higher memory bandwidth for the latency-sensitive
+    # embedding / sampling / all-reduce origin work).
+    if (
+        command.sharding == Sharding.Tensor
+        and master_node_id is not None
+        and os.environ.get("EXO_TENSOR_PREFER_MASTER_RANK0") == "1"
+        and len(selected_cycle) > 1
+        and master_node_id in selected_cycle.node_ids
+    ):
+        ids = list(selected_cycle.node_ids)
+        pivot = ids.index(master_node_id)
+        rotated = ids[pivot:] + ids[:pivot]
+        if rotated != ids:
+            logger.info(
+                "EXO_TENSOR_PREFER_MASTER_RANK0: rotating tensor cycle so master "
+                "{} is device_rank 0 (was rank {})",
+                str(master_node_id)[:12],
+                pivot,
+            )
+            selected_cycle = Cycle(node_ids=rotated)
 
     # Single-node: force Pipeline/Ring (Tensor and Jaccl require multi-node)
     if len(selected_cycle) == 1:
