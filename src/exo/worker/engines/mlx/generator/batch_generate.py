@@ -161,9 +161,7 @@ class ExoBatchGenerator:
         is_exact_hit = False
         prompt_tokens = all_prompt_tokens
 
-        if self.kv_prefix_cache is not None and (
-            not is_bench or task_params.use_prefix_cache
-        ):
+        if self.kv_prefix_cache is not None and task_params.use_prefix_cache:
             cache, remaining_tokens, matched_index, is_exact_hit = (
                 self.kv_prefix_cache.get_kv_cache(
                     self.model, all_prompt_tokens, media_regions=media_regions
@@ -264,7 +262,12 @@ class ExoBatchGenerator:
                 c.values = c._trim(trim_size, c.values)
                 c._idx = c.max_size
 
-        if not is_bench or task_params.use_prefix_cache:
+        # Honor use_prefix_cache literally (was `not is_bench or ...`, which
+        # saved the prefix cache for EVERY normal request regardless of the
+        # flag). Single-shot callers that send use_prefix_cache=False now truly
+        # skip the deepcopy(cache) + pool below — no per-request KV copy churn
+        # and no LRU-evict thrash for bulk work that never reuses a prefix.
+        if task_params.use_prefix_cache:
             min_prefix_hit_length = max(
                 1000, system_prompt_token_count(task_params, self.tokenizer)
             )
