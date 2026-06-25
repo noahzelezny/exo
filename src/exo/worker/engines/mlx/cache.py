@@ -47,6 +47,24 @@ _MEMORY_THRESHOLD = float(
     os.environ.get("EXO_MEMORY_THRESHOLD", _default_memory_threshold())
 )
 
+# Primary KV-pool eviction is by the pool's OWN token footprint, NOT total
+# system memory. Rationale (measured 2026-06-25): the old system-memory trigger
+# fired on the MODEL's transient inference spike (rank-0 node 52%->82%), not on
+# pool size — and because it compared a cluster-wide pressure to each node's
+# *local* threshold, the ring nodes made DIFFERENT eviction decisions, diverging
+# their pools. Divergent pools => the prefix-reuse prefill collective gets a
+# different token count per node => tensor-ring desync => wedge. A token budget
+# is a deterministic quantity that is identical on every node (same prompts
+# added in the same order), so all nodes evict identically and never diverge.
+# ~0.4MB KV/token on the 397B => 48k tokens ~= 19GB of pool. Tune via env.
+_KV_POOL_MAX_TOKENS = int(os.environ.get("EXO_KV_POOL_MAX_TOKENS", 48_000))
+
+# Last-resort OOM guard. Cluster-CONSISTENT: cluster-max pressure vs this single
+# global threshold (NOT the per-node _MEMORY_THRESHOLD that caused the divergence)
+# so all nodes still decide identically. Set high — the token budget should
+# normally keep the pool well clear of this.
+_KV_OOM_THRESHOLD = float(os.environ.get("EXO_KV_OOM_THRESHOLD", 0.92))
+
 
 class CacheSnapshot:
     """Snapshot of states at a known token position."""
@@ -249,6 +267,31 @@ class KVPrefixCache:
         self._last_used.clear()
         self.prefill_tps.clear()
 
+    # --- KVMEM instrumentation (Scout 2026-06-25) -----------------------------
+    # Measures how close the KV prefix pool runs to the eviction ceiling, and
+    # whether the deepcopy spike on add/update/restore crosses it. Pure logging:
+    # uses LOCAL psutil pressure only (module-level get_memory_used_percentage),
+    # NEVER the instance all_gather path — adding a collective for logging would
+    # desync the tensor ring. Each node logs its own pressure to its own
+    # exo-supervised.log; compare M3 vs M4 logs to find the bottleneck node.
+    def _pool_tokens(self) -> int:
+        total = 0
+        for p in self.prompts:
+            try:
+                total += len(p)
+            except Exception:
+                pass
+        return total
+
+    def _log_pool(self, event: str, **extra: object) -> None:
+        mem = get_memory_used_percentage()  # local psutil — no collective
+        parts = " ".join(f"{k}={v}" for k, v in extra.items())
+        logger.info(
+            f"KVMEM event={event} pool={len(self.caches)} "
+            f"pool_tokens={self._pool_tokens()} mem={mem:.4f} "
+            f"thr={_MEMORY_THRESHOLD:.4f} {parts}".rstrip()
+        )
+
     def add_kv_cache(
         self,
         prompt_tokens: mx.array,
@@ -258,6 +301,7 @@ class KVPrefixCache:
         prefill_tps: float = 0.0,
     ):
         """Add a new cache entry. Evicts LRU entries if memory is high."""
+        self._log_pool("add-pre", tokens=len(prompt_tokens))
         self._evict_if_needed()
         self.prompts.append(prompt_tokens)
         self.caches.append(deepcopy(cache))
@@ -266,7 +310,9 @@ class KVPrefixCache:
         self.prefill_tps.append(prefill_tps)
         self._access_counter += 1
         self._last_used.append(self._access_counter)
-        logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
+        # add-post mem minus add-pre mem = the deepcopy spike that lands AFTER
+        # the evictor already decided there was room.
+        self._log_pool("add-post", tokens=len(prompt_tokens))
 
     def update_kv_cache(
         self,
@@ -293,7 +339,7 @@ class KVPrefixCache:
         self.prefill_tps[index] = prefill_tps
         self._access_counter += 1
         self._last_used[index] = self._access_counter
-        logger.info(f"KV cache updated (index {index}): {len(prompt_tokens)} tokens")
+        self._log_pool("update", idx=index, tokens=len(prompt_tokens))
 
     def _get_snapshot(
         self, entry_index: int, target_token_count: int
@@ -377,6 +423,7 @@ class KVPrefixCache:
             return make_kv_cache(model), prompt_tokens, None, False
 
         prompt_cache = deepcopy(self.caches[best_index])
+        self._log_pool("restore", idx=best_index, tokens=cached_length)
         tokens_to_trim = cached_length - restore_pos
         if tokens_to_trim > 0:
             trim_cache(prompt_cache, tokens_to_trim, restore_snap)
@@ -426,34 +473,56 @@ class KVPrefixCache:
 
         return match_length
 
+    def _evict_lru(self, reason: str) -> None:
+        """Pop the least-recently-used pool entry. The LRU index is a function of
+        the access sequence, which is identical on every ring node, so every node
+        evicts the SAME entry — keeping the pools consistent."""
+        lru_index = self._last_used.index(min(self._last_used))
+        evicted_tokens = len(self.prompts[lru_index])
+        self.prompts.pop(lru_index)
+        self.caches.pop(lru_index)
+        self._snapshots.pop(lru_index)
+        self._media_regions.pop(lru_index)
+        self._last_used.pop(lru_index)
+        self.prefill_tps.pop(lru_index)
+        self._log_pool("evict", tokens=evicted_tokens, reason=reason)
+
     def _evict_if_needed(self):
-        """Evict least recently used entries while memory usage is high."""
+        """Evict LRU entries to keep the pool bounded.
+
+        Primary trigger is the pool's OWN token footprint vs a fixed budget — a
+        DETERMINISTIC quantity identical on every node — so all nodes evict the
+        same entries and the pools never diverge (divergence wedges the ring; see
+        the _KV_POOL_MAX_TOKENS note). The system-memory check is kept ONLY as a
+        last-resort OOM guard and is cluster-consistent (cluster-max vs one global
+        threshold), so it too decides identically on all nodes.
+        """
         if len(self.caches) == 0:
             return
 
+        self._log_pool("evict-check")
         evicted_any = False
-        # Evict LRU entries until below threshold
+
+        # Primary: deterministic pool-footprint budget (consistent across nodes).
+        # Keep >=1 entry (the active conversation) even if it alone exceeds budget.
+        while len(self.caches) > 1 and self._pool_tokens() > _KV_POOL_MAX_TOKENS:
+            self._evict_lru("budget")
+            evicted_any = True
+
+        # Safety net: hard OOM guard. cluster-max pressure (all_gather, identical
+        # on every node) vs one global threshold => every node makes the same call
+        # in lockstep, so the all_gather stays balanced and pools stay consistent.
         while (
             len(self.caches) > 0
-            and self.get_memory_used_percentage() > _MEMORY_THRESHOLD
+            and self.get_memory_used_percentage() > _KV_OOM_THRESHOLD
         ):
-            lru_index = self._last_used.index(min(self._last_used))
-            evicted_tokens = len(self.prompts[lru_index])
-            self.prompts.pop(lru_index)
-            self.caches.pop(lru_index)
-            self._snapshots.pop(lru_index)
-            self._media_regions.pop(lru_index)
-            self._last_used.pop(lru_index)
-            self.prefill_tps.pop(lru_index)
-
+            self._evict_lru("oom")
             evicted_any = True
-            logger.info(
-                f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to memory usage"
-            )
 
         if evicted_any:
             gc.collect()
             mx.clear_cache()
+            self._log_pool("evict-done")
 
     def get_memory_used_percentage(self) -> float:
         local_pressure: float = get_memory_used_percentage()
