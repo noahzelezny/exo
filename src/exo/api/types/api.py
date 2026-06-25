@@ -231,6 +231,13 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
     user: str | None = None
+    # Opt-in KV prefix-cache reuse. Default False so single-shot/bulk traffic
+    # does NOT trigger the per-request KV deepcopy+pool (cache.py) — the 397B
+    # bulk "memory pressure" hang. Promoted from Bench-only to the base request
+    # so the live /v1/chat/completions route can carry it; the adapter threads
+    # it into TextGenerationTaskParams. Scout's conversational path sends True,
+    # its single-shot path (backfill/gardener/consult/consensus) sends False.
+    use_prefix_cache: bool = False
 
 
 class BenchChatCompletionRequest(ChatCompletionRequest):
