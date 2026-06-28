@@ -594,9 +594,14 @@ def mlx_generate(
         all_prompt_tokens = vision.prompt_tokens
     media_regions: list[MediaRegion] = vision.media_regions if vision else []
 
-    # Do not use the prefix cache if we are trying to do benchmarks.
+    # Honor use_prefix_cache for ALL requests, not just bench. Single-shot/bulk work
+    # (chat-summary backfill, gardener, consolidation drain) sends use_prefix_cache=
+    # False and NEVER reuses the pool, so the per-request deepcopy+pool is pure waste
+    # — the 397B "memory pressure" churn. Restores Scout ce019259, which a later
+    # refactor (move to generator/generate.py) narrowed back to bench-only. is_bench
+    # still governs eos-banning below; the chat path opts in via use_prefix_cache=True.
     is_bench = task.bench
-    if is_bench and not task.use_prefix_cache:
+    if not task.use_prefix_cache:
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
