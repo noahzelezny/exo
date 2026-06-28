@@ -52,7 +52,6 @@ from exo.worker.engines.mlx.cache import (
 )
 from exo.worker.engines.mlx.constants import (
     DEFAULT_TOP_LOGPROBS,
-    KV_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
     kv_bits_for,
@@ -334,7 +333,7 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    # Scout 2026-06-10: the prefill chunk size sets the PEAK prefill activation
+    # The prefill chunk size sets the PEAK prefill activation
     # memory (≈ chunk_size × seq_len × heads), the transient that OOMs DeepSeek
     # -V4-Flash on long prefills on the tight M3+M4 ring (144GB weights / 224GB
     # RAM → ~8k-token ceiling: it hangs then the OS memory-kills the instance).
@@ -594,9 +593,13 @@ def mlx_generate(
         all_prompt_tokens = vision.prompt_tokens
     media_regions: list[MediaRegion] = vision.media_regions if vision else []
 
-    # Do not use the prefix cache if we are trying to do benchmarks.
+    # Honor use_prefix_cache for ALL requests, not just bench. Single-shot/bulk
+    # clients send use_prefix_cache=False and never reuse the pool, so the
+    # per-request deepcopy+pool is pure waste — measured as sustained memory
+    # churn on a 397B MoE. is_bench still governs eos-banning below; the chat
+    # path opts in via use_prefix_cache=True.
     is_bench = task.bench
-    if is_bench and not task.use_prefix_cache:
+    if not task.use_prefix_cache:
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
