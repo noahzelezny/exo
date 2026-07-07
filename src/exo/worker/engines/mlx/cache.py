@@ -1,3 +1,4 @@
+import contextlib
 import gc
 import os
 from copy import deepcopy
@@ -64,6 +65,19 @@ _KV_POOL_MAX_TOKENS = int(os.environ.get("EXO_KV_POOL_MAX_TOKENS", 48_000))
 # so all nodes still decide identically. Set high — the token budget should
 # normally keep the pool well clear of this.
 _KV_OOM_THRESHOLD = float(os.environ.get("EXO_KV_OOM_THRESHOLD", 0.92))
+
+# Cap retained SSM/compressor snapshots per pool entry. Each CacheSnapshot is a
+# full deepcopy of the (non-trimmable) V4 compressor pool, whose bytes grow with
+# its token_count. Retaining one at EVERY prefill-chunk boundary (as the merge
+# in update_kv_cache did) accumulates ~1 snapshot per 2048 tokens across
+# agent-loop turns, so total snapshot bytes grow O(context^2): measured ~11GB
+# (~5.5GB/node) at 81k ctx on DeepSeek-V4-Flash — the dominant term in the
+# long-context GPU (Metal) OOM, and counted by NEITHER the token-budget nor the
+# system-RAM guard. _thin_snapshots keeps a geometric spread (largest per
+# log2(token_count) bucket + always the newest) so per-entry snapshot memory is
+# O(context) (~2x the resident cache) while every restore target stays within
+# ~2x of a kept snapshot. Tune via env.
+_MAX_SNAPSHOTS_PER_ENTRY = int(os.environ.get("EXO_KV_MAX_SNAPSHOTS_PER_ENTRY", 8))
 
 
 class CacheSnapshot:
@@ -231,6 +245,49 @@ def _find_nearest_snapshot(
     return best
 
 
+def _thin_snapshots(
+    snapshots: list[CacheSnapshot] | None,
+    max_keep: int = _MAX_SNAPSHOTS_PER_ENTRY,
+) -> list[CacheSnapshot] | None:
+    """Bound per-entry snapshot memory to O(context) instead of O(context^2).
+
+    Each CacheSnapshot is a full copy of the non-trimmable V4 compressor pool,
+    whose size grows with its token_count. Retaining a snapshot at every
+    prefill-chunk boundary (as update_kv_cache's merge did) keeps one per ~2048
+    tokens, so total snapshot bytes grow quadratically with the conversation
+    length and drive the V4 long-context GPU OOM.
+
+    Keep at most one snapshot per log2(token_count) bucket (a geometric spread
+    over [0, newest]) and always the newest — needed for exact / continuation
+    reuse (the common agent-loop case). That bounds the count to ~log2(context)
+    and total bytes to ~2x the resident cache, while keeping every restore
+    target within ~2x of a retained snapshot: partial / branch reuse degrades to
+    at-most-2x re-prefill rather than falling all the way back to a full prefill.
+    """
+    if not snapshots or len(snapshots) <= max_keep:
+        return snapshots
+    ordered = sorted(snapshots, key=lambda s: s.token_count)
+    newest = ordered[-1]
+    # Largest snapshot per log2 bucket => geometric coverage of the token axis.
+    by_bucket: dict[int, CacheSnapshot] = {}
+    for s in ordered:
+        bucket = max(1, s.token_count).bit_length()
+        cur = by_bucket.get(bucket)
+        if cur is None or s.token_count > cur.token_count:
+            by_bucket[bucket] = s
+    kept = sorted(by_bucket.values(), key=lambda s: s.token_count)
+    if newest.token_count != kept[-1].token_count:
+        kept.append(newest)
+    # Belt-and-suspenders hard cap: keep the newest max_keep by token_count.
+    if len(kept) > max_keep:
+        kept = kept[-max_keep:]
+    logger.info(
+        f"KVMEM thin-snapshots {len(snapshots)}->{len(kept)} "
+        f"kept_tc={[s.token_count for s in kept]}"
+    )
+    return kept
+
+
 def is_non_trimmable_cache_entry(c: object) -> bool:
     """A cache entry is non-trimmable if `trim(n)` can't roll back its full
     state — meaning the prefill +2 rollback must snapshot+restore it instead.
@@ -267,7 +324,7 @@ class KVPrefixCache:
         self._last_used.clear()
         self.prefill_tps.clear()
 
-    # --- KVMEM instrumentation (Scout 2026-06-25) -----------------------------
+    # --- KV pool instrumentation ----------------------------------------------
     # Measures how close the KV prefix pool runs to the eviction ceiling, and
     # whether the deepcopy spike on add/update/restore crosses it. Pure logging:
     # uses LOCAL psutil pressure only (module-level get_memory_used_percentage),
@@ -277,10 +334,8 @@ class KVPrefixCache:
     def _pool_tokens(self) -> int:
         total = 0
         for p in self.prompts:
-            try:
+            with contextlib.suppress(Exception):
                 total += len(p)
-            except Exception:
-                pass
         return total
 
     def _log_pool(self, event: str, **extra: object) -> None:
@@ -305,7 +360,7 @@ class KVPrefixCache:
         self._evict_if_needed()
         self.prompts.append(prompt_tokens)
         self.caches.append(deepcopy(cache))
-        self._snapshots.append(ssm_snapshots)
+        self._snapshots.append(_thin_snapshots(ssm_snapshots))
         self._media_regions.append(media_regions or [])
         self.prefill_tps.append(prefill_tps)
         self._access_counter += 1
@@ -334,7 +389,7 @@ class KVPrefixCache:
 
         self.prompts[index] = prompt_tokens
         self.caches[index] = deepcopy(cache)
-        self._snapshots[index] = merged or None
+        self._snapshots[index] = _thin_snapshots(merged) or None
         self._media_regions[index] = media_regions or []
         self.prefill_tps[index] = prefill_tps
         self._access_counter += 1

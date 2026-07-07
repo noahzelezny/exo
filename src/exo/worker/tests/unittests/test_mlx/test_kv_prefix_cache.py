@@ -106,6 +106,40 @@ class TestKVPrefix:
         assert len(cache.prompts) == 0
 
 
+def test_thin_snapshots_bounds_snapshot_memory():
+    """Regression: update_kv_cache used to retain a snapshot at EVERY prefill-
+    chunk boundary, growing per-entry snapshot memory O(context^2) (~11GB at 81k
+    on V4-Flash) and driving the long-context GPU OOM. _thin_snapshots keeps a
+    geometric spread (largest per log2(token_count) bucket + always the newest)
+    so memory is O(context) and any restore target stays within ~2x of a kept
+    snapshot."""
+    from exo.worker.engines.mlx.cache import (
+        _MAX_SNAPSHOTS_PER_ENTRY,
+        CacheSnapshot,
+        _thin_snapshots,
+    )
+
+    def snaps(tcs):
+        return [CacheSnapshot(states=[], token_count=tc) for tc in tcs]
+
+    # None / empty / already-small lists pass through untouched.
+    assert _thin_snapshots(None) is None
+    small = snaps([2048, 4096])
+    assert _thin_snapshots(small) is small
+
+    # A dense accumulation is bounded, keeps the newest, and stays covering.
+    full = list(range(2048, 80001, 2048))  # 39 boundaries
+    thinned = _thin_snapshots(snaps(full))
+    tcs = [s.token_count for s in thinned]
+    assert len(thinned) <= _MAX_SNAPSHOTS_PER_ENTRY
+    assert tcs[-1] == full[-1]  # newest kept => exact/continuation reuse preserved
+    for target in (2048, 12000, 30000, 79000):
+        below = [tc for tc in tcs if tc <= target]
+        assert below and max(below) * 2 + 2048 >= target  # within ~2x
+    # O(context), not O(context^2): retained token-count mass << dense mass.
+    assert sum(tcs) < sum(full) / 4
+
+
 def _load_gpt_oss() -> tuple[Model, object]:
     from mlx_lm.utils import load_model
 
