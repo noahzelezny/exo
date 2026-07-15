@@ -4,6 +4,7 @@ from collections.abc import Generator
 from dataclasses import dataclass
 
 import mlx.core as mx
+from mlx_lm.models.cache import ChunkedKVCache
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.common import ModelId
@@ -27,6 +28,22 @@ from .utils_mlx import (
     load_mlx_items,
 )
 from .vision import VisionProcessor
+
+
+def _has_unbatchable_cache(model: Model) -> bool:
+    """mlx_lm's batch engine rejects some cache types ("ChunkedKVCache does not
+    yet support batching with history" — llama4 being the current case), and the
+    prefix pool's trim semantics are unverified across chunk boundaries. Probe
+    the model's cache layout; such models run on the sequential engine with a
+    fresh cache per request.
+    """
+    make_cache = getattr(model, "make_cache", None)
+    if make_cache is None:
+        return False
+    try:
+        return any(isinstance(c, ChunkedKVCache) for c in make_cache())
+    except Exception:
+        return False
 
 
 @dataclass
@@ -83,14 +100,20 @@ class MlxBuilder(Builder):
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH"):
-            logger.info("using SequentialGenerator (batching disabled)")
+        unbatchable = _has_unbatchable_cache(self.inference_model)
+        if os.environ.get("EXO_NO_BATCH") or unbatchable:
+            reason = (
+                "chunked KV cache; batch engine and prefix pool disabled"
+                if unbatchable
+                else "batching disabled"
+            )
+            logger.info(f"using SequentialGenerator ({reason})")
             return SequentialGenerator(
                 model=self.inference_model,
                 tokenizer=self.tokenizer,
                 group=self.group,
                 tool_parser=tool_parser,
-                kv_prefix_cache=kv_prefix_cache,
+                kv_prefix_cache=None if unbatchable else kv_prefix_cache,
                 model_id=self.model_id,
                 device_rank=device_rank,
                 cancel_receiver=self.cancel_receiver,
