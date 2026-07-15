@@ -562,6 +562,46 @@ def consolidate_system_messages(
     return formatted_messages
 
 
+def _system_messages_in_place(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Messages with system content left at its position (no hoisting).
+
+    Applies only the normalizations consolidation also applies: "developer"
+    becomes "system" (Codex), and system messages with empty content are
+    dropped. Non-system messages pass through by reference.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") in ("system", "developer"):
+            if not msg.get("content"):
+                continue
+            out.append({**msg, "role": "system"})
+        else:
+            out.append(msg)
+    return out
+
+
+def _system_content_survived(
+    messages: list[dict[str, Any]], prompt: str
+) -> bool:
+    """True iff every system message's text content appears in the rendered
+    prompt.
+
+    Some templates render only a leading system message and silently drop
+    later ones — losing instructions is worse than losing the KV prefix, so
+    a drop sends rendering back to the consolidated layout. Compared
+    whitespace-trimmed because templates commonly apply ``| trim``.
+    """
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content and content.strip() not in prompt:
+            return False
+    return True
+
+
 def render_chat_template(
     tokenizer: TokenizerWrapper,
     messages: list[dict[str, Any]],
@@ -631,6 +671,52 @@ def render_chat_template(
             prompt += partial_assistant_content
         return prompt
 
+    # Generic chat-template path. Try rendering system messages IN PLACE
+    # first: preserving the client's message order keeps the prompt's token
+    # prefix byte-stable across requests that only append (chat turns, agent
+    # loops) — exactly what KVPrefixCache reuses. Consolidating every system
+    # message to the top rewrites the prompt at the first volatile block
+    # (measured live: a per-turn memory block hoisted into the top system
+    # message forced a full ~12k-token re-prefill on every chat turn and
+    # after every mid-run system nudge). Fall back to the consolidated
+    # layout when the template can't render mid-conversation system
+    # messages (raises) or silently drops one.
+    inplace_messages = _system_messages_in_place(messages)
+    inplace_partial: str | None = None
+    if inplace_messages and inplace_messages[-1].get("role") == "assistant":
+        inplace_partial = cast(str, inplace_messages[-1].get("content", ""))
+        inplace_messages = inplace_messages[:-1]
+    try:
+        prompt = _render_with_chat_template(tokenizer, inplace_messages, task_params)
+    except Exception:
+        logger.debug(
+            "in-place system-message render failed; falling back to "
+            "consolidated system messages",
+            exc_info=True,
+        )
+    else:
+        if _system_content_survived(inplace_messages, prompt):
+            if inplace_partial:
+                prompt += inplace_partial
+            return prompt
+        logger.info(
+            "chat template dropped an in-place system message; falling back "
+            "to consolidated system messages"
+        )
+
+    prompt = _render_with_chat_template(tokenizer, formatted_messages, task_params)
+
+    if partial_assistant_content:
+        prompt += partial_assistant_content
+
+    return prompt
+
+
+def _render_with_chat_template(
+    tokenizer: TokenizerWrapper,
+    formatted_messages: list[dict[str, Any]],
+    task_params: TextGenerationTaskParams,
+) -> str:
     for msg in formatted_messages:
         _normalize_tool_calls(msg)
 
@@ -672,9 +758,6 @@ def render_chat_template(
 
     if task_params.tools and _schemas_lost_in_prompt(prompt, task_params.tools):
         logger.warning("Chat template lost nested tool schemas even after patching")
-
-    if partial_assistant_content:
-        prompt += partial_assistant_content
 
     return prompt
 
