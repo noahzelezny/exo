@@ -19,7 +19,10 @@ from exo.worker.runner.llm_inference.batch_generator import (
     BatchGenerator,
     SequentialGenerator,
 )
-from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
+from exo.worker.runner.llm_inference.tool_parsers import (
+    make_llama4_parser,
+    make_mlx_parser,
+)
 
 from .cache import KVPrefixCache
 from .types import Model
@@ -96,6 +99,12 @@ class MlxBuilder(Builder):
                 self.tokenizer.tool_call_end,
                 self.tokenizer.tool_parser,  # type: ignore
             )
+        elif getattr(self.inference_model, "model_type", "") == "llama4":
+            # mlx_lm's TokenizerWrapper carries no tool tokens for llama4;
+            # without a parser its <|python_start|>{...}<|python_end|> calls
+            # stream to the client as raw text.
+            logger.info("using llama4 <|python_start|> tool parser")
+            tool_parser = make_llama4_parser()
 
         kv_prefix_cache = KVPrefixCache(self.group)
 
