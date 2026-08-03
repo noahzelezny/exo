@@ -108,9 +108,17 @@ class Router:
         identity: Keypair,
         bootstrap_peers: Sequence[str] = (),
         listen_port: int = 0,
+        listen_ips: Sequence[str] = (),
+        enable_mdns: bool = True,
     ) -> "Router":
         return cls(
-            handle=NetworkingHandle(identity, list(bootstrap_peers), listen_port)
+            handle=NetworkingHandle(
+                identity,
+                list(bootstrap_peers),
+                listen_port,
+                list(listen_ips),
+                enable_mdns,
+            )
         )
 
     def __init__(self, handle: NetworkingHandle):

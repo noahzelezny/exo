@@ -55,6 +55,8 @@ class Node:
             keypair,
             bootstrap_peers=args.bootstrap_peers,
             listen_port=args.libp2p_port,
+            listen_ips=args.libp2p_hosts,
+            enable_mdns=args.mdns,
         )
         await router.register_topic(topics.GLOBAL_EVENTS)
         await router.register_topic(topics.LOCAL_EVENTS)
@@ -302,6 +304,11 @@ def main():
     if args.bootstrap_peers:
         logger.info(f"Bootstrap peers: {args.bootstrap_peers}")
 
+    if args.libp2p_hosts:
+        logger.info(f"libp2p listening on {args.libp2p_hosts} port {args.libp2p_port}")
+    if not args.mdns:
+        logger.info("mDNS discovery disabled (--no-mdns) — pairing via bootstrap peers only")
+
     if args.no_batch:
         os.environ["EXO_NO_BATCH"] = "1"
         logger.info("Continuous batching disabled (--no-batch)")
@@ -347,6 +354,8 @@ class Args(FrozenModel):
     no_stdio: bool = False
     bootstrap_peers: list[str] = []
     libp2p_port: int
+    libp2p_hosts: list[str] = []  # empty = historical 0.0.0.0
+    mdns: bool = True
 
     @classmethod
     def parse(cls) -> Self:
@@ -432,6 +441,20 @@ class Args(FrozenModel):
             default=0,
             dest="libp2p_port",
             help="Fixed TCP port for libp2p to listen on (0 = OS-assigned).",
+        )
+        parser.add_argument(
+            "--libp2p-host",
+            type=lambda s: [h for h in (p.strip() for p in s.split(",")) if h],
+            default=[h for h in (p.strip() for p in os.getenv("EXO_LIBP2P_HOST", "").split(",")) if h],
+            dest="libp2p_hosts",
+            help="Comma-separated IPs for the libp2p listener; empty = all interfaces (env: EXO_LIBP2P_HOST)",
+        )
+        parser.add_argument(
+            "--no-mdns",
+            action="store_false",
+            dest="mdns",
+            default=os.getenv("EXO_NO_MDNS", "false").lower() != "true",
+            help="Disable mDNS discovery; peers connect via --bootstrap-peers only (env: EXO_NO_MDNS=true)",
         )
         fast_synch_group = parser.add_mutually_exclusive_group()
         fast_synch_group.add_argument(

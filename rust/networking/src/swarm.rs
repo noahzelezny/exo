@@ -146,11 +146,17 @@ fn filter_swarm_event(event: SwarmEvent<BehaviourEvent>) -> Option<FromSwarm> {
 ///
 /// - `listen_port`: TCP port to listen on. `0` lets the OS assign one.
 /// - `bootstrap_peers`: multiaddrs to dial for environments without mDNS.
+/// - `listen_ips`: IPs to listen on; empty means the historical `0.0.0.0`.
+///   Each IP gets its own listener; at least one must be accepted.
+/// - `enable_mdns`: when false, no mDNS sockets are opened and pairing relies
+///   entirely on `bootstrap_peers`.
 pub fn create_swarm(
     keypair: identity::Keypair,
     from_client: mpsc::Receiver<ToSwarm>,
     bootstrap_peers: Vec<String>,
     listen_port: u16,
+    listen_ips: Vec<String>,
+    enable_mdns: bool,
 ) -> alias::AnyResult<Swarm> {
     let parsed_bootstrap_peers: Vec<libp2p::Multiaddr> = bootstrap_peers
         .iter()
@@ -161,10 +167,32 @@ pub fn create_swarm(
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_other_transport(tcp_transport)?
-        .with_behaviour(|keypair| Behaviour::new(keypair, parsed_bootstrap_peers))?
+        .with_behaviour(|keypair| Behaviour::new(keypair, parsed_bootstrap_peers, enable_mdns))?
         .build();
 
-    swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?)?;
+    let ips = if listen_ips.is_empty() {
+        vec!["0.0.0.0".to_string()]
+    } else {
+        listen_ips
+    };
+    let mut listening = 0usize;
+    let mut last_err: Option<String> = None;
+    for ip in &ips {
+        match format!("/ip4/{ip}/tcp/{listen_port}").parse::<libp2p::Multiaddr>() {
+            Ok(addr) => match swarm.listen_on(addr) {
+                Ok(_) => listening += 1,
+                Err(e) => last_err = Some(format!("listen_on {ip}: {e}")),
+            },
+            Err(e) => last_err = Some(format!("bad listen ip {ip}: {e}")),
+        }
+    }
+    if listening == 0 {
+        return Err(format!(
+            "no libp2p listener could be established on {ips:?}: {}",
+            last_err.unwrap_or_else(|| "unknown error".into())
+        )
+        .into());
+    }
     Ok(Swarm { swarm, from_client })
 }
 
@@ -259,9 +287,10 @@ mod behaviour {
         pub fn new(
             keypair: &identity::Keypair,
             bootstrap_peers: Vec<libp2p::Multiaddr>,
+            enable_mdns: bool,
         ) -> alias::AnyResult<Self> {
             Ok(Self {
-                discovery: discovery::Behaviour::new(keypair, bootstrap_peers)?,
+                discovery: discovery::Behaviour::new(keypair, bootstrap_peers, enable_mdns)?,
                 gossipsub: gossipsub_behaviour(keypair),
             })
         }

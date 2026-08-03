@@ -25,6 +25,7 @@ const RETRY_CONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 mod managed {
     use libp2p::swarm::NetworkBehaviour;
+    use libp2p::swarm::behaviour::toggle::Toggle;
     use libp2p::{identity, mdns, ping};
     use std::io;
     use std::time::Duration;
@@ -36,14 +37,19 @@ mod managed {
 
     #[derive(NetworkBehaviour)]
     pub struct Behaviour {
-        mdns: mdns::tokio::Behaviour,
+        mdns: Toggle<mdns::tokio::Behaviour>,
         ping: ping::Behaviour,
     }
 
     impl Behaviour {
-        pub fn new(keypair: &identity::Keypair) -> io::Result<Self> {
+        pub fn new(keypair: &identity::Keypair, enable_mdns: bool) -> io::Result<Self> {
+            let mdns = if enable_mdns {
+                Toggle::from(Some(mdns_behaviour(keypair)?))
+            } else {
+                Toggle::from(None)
+            };
             Ok(Self {
-                mdns: mdns_behaviour(keypair)?,
+                mdns,
                 ping: ping_behaviour(),
             })
         }
@@ -113,9 +119,13 @@ pub struct Behaviour {
 }
 
 impl Behaviour {
-    pub fn new(keypair: &identity::Keypair, bootstrap_peers: Vec<Multiaddr>) -> io::Result<Self> {
+    pub fn new(
+        keypair: &identity::Keypair,
+        bootstrap_peers: Vec<Multiaddr>,
+        enable_mdns: bool,
+    ) -> io::Result<Self> {
         Ok(Self {
-            managed: managed::Behaviour::new(keypair)?,
+            managed: managed::Behaviour::new(keypair, enable_mdns)?,
             mdns_discovered: HashMap::new(),
             bootstrap_peers,
             retry_delay: Delay::new(RETRY_CONNECT_INTERVAL),
