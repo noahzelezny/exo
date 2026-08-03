@@ -90,6 +90,7 @@ class Node:
             api = API(
                 node_id,
                 port=args.api_port,
+                host=args.api_host,
                 event_receiver=event_router.receiver(),
                 command_sender=router.sender(topics.COMMANDS),
                 download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
@@ -332,6 +333,11 @@ class Args(FrozenModel):
     force_master: bool = False
     spawn_api: bool = False
     api_port: PositiveInt = 52415
+    # Comma-separated bind hosts for the HTTP API. Default matches upstream
+    # (all interfaces). Scout launches pass loopback + the TB4 bridge IP so
+    # the unauthenticated control API is not reachable from the home LAN
+    # (2026-08-03 audit: 192.168.1.x could hit /state on both nodes).
+    api_host: str = "0.0.0.0"
     tb_only: bool = False
     no_worker: bool = False
     no_downloads: bool = False
@@ -377,6 +383,14 @@ class Args(FrozenModel):
             type=int,
             dest="api_port",
             default=52415,
+        )
+        parser.add_argument(
+            "--api-host",
+            type=str,
+            dest="api_host",
+            default=os.getenv("EXO_API_HOST", "0.0.0.0"),
+            help="Comma-separated hosts the HTTP API binds to "
+            "(env: EXO_API_HOST; default 0.0.0.0 = all interfaces).",
         )
         parser.add_argument(
             "--no-worker",

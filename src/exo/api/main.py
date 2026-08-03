@@ -239,6 +239,7 @@ class API:
         node_id: NodeId,
         *,
         port: int,
+        host: str = "0.0.0.0",
         event_receiver: Receiver[IndexedEvent],
         command_sender: Sender[ForwarderCommand],
         download_command_sender: Sender[ForwarderDownloadCommand],
@@ -255,6 +256,7 @@ class API:
         self.node_id: NodeId = node_id
         self.last_completed_election: int = 0
         self.port = port
+        self.host = host
         self._sent_image_hashes: set[str] = set()
 
         self.paused: bool = False
@@ -1897,7 +1899,15 @@ class API:
 
     async def run_api(self, ev: anyio.Event):
         cfg = Config()
-        cfg.bind = [f"0.0.0.0:{self.port}"]
+        # hypercorn accepts a bind LIST — one socket per host. Scout passes
+        # "127.0.0.1,10.0.0.x" (loopback for same-box clients + the TB4
+        # bridge for the peer node) so nothing changes for existing callers
+        # while the home LAN gets no socket at all.
+        cfg.bind = [
+            f"{h.strip()}:{self.port}"
+            for h in self.host.split(",")
+            if h.strip()
+        ]
         # nb: shared.logging needs updating if any of this changes
         cfg.accesslog = None
         cfg.errorlog = "-"
