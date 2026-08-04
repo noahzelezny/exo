@@ -1,0 +1,51 @@
+model_id = "spicyneuron/Qwen3.5-397B-A17B-MLX-2.6bit"
+n_layers = 60
+hidden_size = 4096
+num_key_value_heads = 2
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "qwen"
+quantization = "2.6bit"
+base_model = "Qwen3.5 397B A17B"
+capabilities = ["text", "thinking", "thinking_toggle"]
+reasoning_dialect = "post_last_user"
+context_length = 262144
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
+[storage_size]
+in_bytes = 129463143552
+
+# Mirrors exo's builtin mlx-community/Qwen3.5-397B-A17B-{4,8}bit cards (same base
+# model → identical n_layers/hidden_size/kv_heads/context), with this quant's own
+# model_id, quantization label, and authoritative storage_size (= total_size from
+# this repo's model.safetensors.index.json, 120.57 GiB).
+#
+# NOTE: capabilities OMIT "vision" on purpose — the mlx-community 397B cards list
+# it, but this spicyneuron 2.6bit is a TEXT-ONLY quant (no vision_config in
+# config.json; exo's detect_vision_from_config() returns None). Don't re-add it.
+#
+# WHY THIS LIVES IN THE BUILTIN DIR (not ~/.exo/custom_model_cards): exo's worker
+# runs a 1 Hz reconciler (_reconcile_custom_cards) that makes the custom dir EXACTLY
+# mirror event-log state — it pop()s (unlinks) any custom-dir TOML not backed by a
+# CustomModelCardAdded event. exo-reset.sh moves ~/.exo/event_log aside, so after a
+# reset the state is empty and the reconciler garbage-collects every custom card
+# ("it disappears when I reset exo"). pop() only ever touches the custom dir, so a
+# builtin card is immune to both the reconciler and the reset. Install with
+# scripts/exo-install-model-cards.sh (M3 + M4).
+#
+# Source: https://huggingface.co/spicyneuron/Qwen3.5-397B-A17B-MLX-2.6bit
+# Source: https://huggingface.co/Qwen/Qwen3.5-397B-A17B#best-practices
+[sampling_defaults]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+repetition_penalty = 1.0
+presence_penalty = 0.0
+
+[sampling_defaults.non_thinking]
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+repetition_penalty = 1.0
+presence_penalty = 1.5
