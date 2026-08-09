@@ -415,7 +415,15 @@ class VisionEncoder:
         )
 
     def _load_weights_from_model_repo(self) -> None:
-        safetensors_files = sorted(self._model_path.glob("*.safetensors"))
+        # Include one level of subdirectories: some quantizers ship the vision
+        # tower as a sidecar file the safetensors index points into (e.g.
+        # OptiQ's optiq/optiq_vision.safetensors with stock vision_tower.*
+        # keys) — a top-level-only glob silently drops the tower and this
+        # runner degrades to text-only.
+        safetensors_files = sorted(
+            set(self._model_path.glob("*.safetensors"))
+            | set(self._model_path.glob("*/*.safetensors"))
+        )
         if not safetensors_files:
             raise FileNotFoundError(f"No safetensors files found in {self._model_path}")
 

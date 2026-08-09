@@ -256,6 +256,11 @@ class ModelCard(FrozenModel):
             trust_remote_code=False,
             is_custom=True,
             vision=config_data.vision,
+            # A card whose config declares a vision tower must also advertise
+            # the "vision" capability — the GUI's image-attach button and
+            # downstream clients (e.g. Scout's vision probe) key off this
+            # list, not the vision block itself.
+            capabilities=(["text", "vision"] if config_data.vision else ["text"]),
             backends=list(
                 Backend
             ),  # all backends — we don't know what an arbitrary HF model supports; let placement gate decide
