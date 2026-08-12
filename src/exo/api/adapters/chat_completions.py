@@ -169,6 +169,7 @@ async def chat_request_to_text_generation(
         if chat_template_messages
         else None,
         logprobs=request.logprobs or False,
+        echo_score=request.echo_score,
         top_logprobs=request.top_logprobs,
         min_p=request.min_p,
         repetition_penalty=request.repetition_penalty,

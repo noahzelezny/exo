@@ -115,6 +115,11 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     bench: bool = False
+    # Score the prompt instead of generating: one forward pass over the prompt,
+    # returns total/per-token NLL + PPL as JSON in the completion text. Prefill
+    # logits are computed anyway and normally discarded; this exposes them for
+    # cluster-held perplexity evaluation of models too big for a single box.
+    echo_score: bool = False
     use_prefix_cache: bool = False
     top_k: int | None = None
     stop: str | list[str] | None = None

@@ -539,6 +539,81 @@ def extract_top_logprobs(
     return selected_logprob, top_logprob_items
 
 
+def _echo_score(
+    model: Model,
+    task: TextGenerationTaskParams,
+    all_prompt_tokens: list[int] | mx.array,
+    group: mx.distributed.Group | None,
+    prefill_tps_placeholder: float = 0.0,
+) -> Generator[GenerationResponse]:
+    """Chunked prompt-NLL scoring pass (see task.echo_score)."""
+    import json as _json
+
+    toks = mx.array(all_prompt_tokens)
+    n = toks.shape[0]
+    if n < 2:
+        yield GenerationResponse(
+            text=_json.dumps({"error": "echo_score needs >= 2 prompt tokens"}),
+            token=0, finish_reason="stop", usage=None,
+        )
+        return
+
+    caches = make_kv_cache(model=model)
+    # Deliberately NOT set_pipeline_prefill(is_prefill=True) here: that flag
+    # gates PipelineLastLayer's cross-rank all_gather (auto_parallel.py) off,
+    # which is the right call for ordinary prefill (only the last rank's
+    # logits matter before decode) but wrong for scoring — every rank must
+    # return the real, gathered logits since we can't assume which rank's
+    # response the caller reads. Leaving is_prefill at its default False
+    # keeps the gather on, at the cost of one all_gather per chunk.
+    mx_barrier(group)
+    start = time.perf_counter()
+    step = int(os.getenv("EXO_ECHO_SCORE_STEP", "1024"))
+    total_nll = 0.0
+    scored = 0
+    for i in range(0, n - 1, step):
+        chunk = toks[i : min(i + step, n - 1)]
+        targets = toks[i + 1 : i + 1 + chunk.shape[0]]
+        logits = model(chunk[None], cache=caches)
+        logits = logits[0].astype(mx.float32)
+        logsumexp = mx.logsumexp(logits, axis=-1)
+        tgt_logit = mx.take_along_axis(
+            logits, targets[:, None].astype(mx.int64), axis=-1
+        )[:, 0]
+        nll = logsumexp - tgt_logit
+        chunk_nll = mx.sum(nll)
+        mx.eval(chunk_nll)
+        total_nll += float(chunk_nll.item())
+        scored += int(chunk.shape[0])
+    elapsed = time.perf_counter() - start
+    set_pipeline_prefill(model, is_prefill=False)
+
+    nll_per_token = total_nll / max(scored, 1)
+    result = {
+        "echo_score": True,
+        "total_nll": round(total_nll, 4),
+        "tokens_scored": scored,
+        "nll_per_token": round(nll_per_token, 6),
+        "ppl": round(math.exp(min(nll_per_token, 30.0)), 4),
+        "seconds": round(elapsed, 2),
+        "tok_per_sec": round(scored / elapsed if elapsed > 0 else 0.0, 1),
+    }
+    usage = Usage(
+        prompt_tokens=int(n), completion_tokens=0, total_tokens=int(n),
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+        completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
+    )
+    stats = GenerationStats(
+        prompt_tps=float(result["tok_per_sec"]), generation_tps=0.0,
+        prompt_tokens=int(n), generation_tokens=0,
+        peak_memory_usage=Memory.from_gb(mx.get_peak_memory() / 1e9),
+    )
+    yield GenerationResponse(
+        text=_json.dumps(result), token=0, finish_reason="stop",
+        stats=stats, usage=usage,
+    )
+
+
 def mlx_generate(
     model: Model,
     tokenizer: TokenizerWrapper,
@@ -593,6 +668,18 @@ def mlx_generate(
     if vision is not None:
         all_prompt_tokens = vision.prompt_tokens
     media_regions: list[MediaRegion] = vision.media_regions if vision else []
+
+    if task.echo_score:
+        # Prompt scoring: one chunked forward pass over the prompt, computing
+        # NLL of each next token from the logits prefill normally discards.
+        # Enables cluster-held perplexity evaluation of models too large for
+        # any single box. SPMD-safe: PipelineLastLayer all_gathers logits, so
+        # every rank computes the identical result (auto_parallel.py).
+        yield from _echo_score(
+            model, task, all_prompt_tokens, group,
+            prefill_tps_placeholder=0.0,
+        )
+        return
 
     # Honor use_prefix_cache for ALL requests, not just bench. Single-shot/bulk work
     # (chat-summary backfill, gardener, consolidation drain) sends use_prefix_cache=

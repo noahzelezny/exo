@@ -223,6 +223,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: float | None = None
     top_k: int | None = None
     tools: list[dict[str, Any]] | None = None
+    # exo extension: score the prompt (one prefill pass, no generation);
+    # completion text returns JSON {total_nll, tokens, nll_per_token, ppl}.
+    echo_score: bool = False
     reasoning_effort: ReasoningEffort | None = None
     enable_thinking: bool | None = None
     min_p: float | None = None

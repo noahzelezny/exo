@@ -406,8 +406,22 @@ class BatchGenerator(Engine):
             self.agree_on_tasks()
 
         # Submit any queued tasks to the engine
+        echo_output: list[
+            tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
+        ] = []
         while self._queue and len(self._active_tasks) < EXO_MAX_CONCURRENT_REQUESTS:
             task = self._queue.popleft()
+            if task.task_params.echo_score:
+                # Prompt scoring runs synchronously outside the batch engine:
+                # every rank dequeues this task at the same agreed position, so
+                # all ranks execute the identical scoring forwards (SPMD-safe).
+                # step() is NOT a generator (it returns iterators) — collect
+                # and chain rather than yield.
+                try:
+                    echo_output.extend(self._run_echo_score(task))
+                except Exception as e:
+                    self._send_error(task, e)
+                continue
             try:
                 uid = self._start_task(task)
             except PrefillCancelled:
@@ -434,7 +448,7 @@ class BatchGenerator(Engine):
             self._active_tasks[uid] = (task, queue, output_generator)
 
         if not self._gen.has_work:
-            return self._apply_cancellations()
+            return itertools.chain(echo_output, self._apply_cancellations())
 
         results = self._gen.step()
 
@@ -462,8 +476,25 @@ class BatchGenerator(Engine):
             lambda chunk: (
                 not isinstance(chunk[1], GenerationChunk) or self.device_rank == 0
             ),
-            itertools.chain(output, self._apply_cancellations()),
+            itertools.chain(echo_output, output, self._apply_cancellations()),
         )
+
+
+    def _run_echo_score(
+        self, task: TextGeneration
+    ) -> Iterator[tuple[TaskId, GenerationChunk | FinishedResponse]]:
+        """Score the prompt (see TextGenerationTaskParams.echo_score)."""
+        from exo.worker.engines.mlx.generator.generate import _echo_score
+        from exo.worker.engines.mlx.cache import encode_prompt
+
+        prompt = apply_chat_template(self.tokenizer, task.task_params)
+        toks = encode_prompt(self.tokenizer, prompt)
+        for resp in _echo_score(self.model, task.task_params, toks, self.group):
+            if self.device_rank == 0:
+                chunk = map_responses_to_chunks(resp, self.model_id)
+                if chunk is not None:
+                    yield (task.task_id, chunk)
+        yield (task.task_id, FinishedResponse())
 
     def _apply_cancellations(
         self,
