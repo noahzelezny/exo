@@ -1,0 +1,31 @@
+model_id = "rotlab/35B-vqK256codes"
+n_layers = 40
+hidden_size = 2048
+num_key_value_heads = 2
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "qwen"
+quantization = "vq-d4K256"
+base_model = "Qwen3.5 35B A3B"
+capabilities = ["text", "thinking", "thinking_toggle"]
+reasoning_dialect = "post_last_user"
+context_length = 262144
+backends = ["MlxMetal"]
+[storage_size]
+in_bytes = 10891734524
+
+# quantlab M1d smoke card — 35B expert weights vector-quantized (d=4, K=256,
+# codes uint8 + fp16 codebook + fp16 group scales; 10.1 GiB total). Loads via
+# the VQ hook patched into each node's exo-env mlx_lm (patch_mlx_lm.py) and
+# quantlab/vq_switch.py; tensor-parallel needs the codebook-replicate guard in
+# exo auto_parallel.py (both checkouts, 2026-08-15). Values/config match
+# rotlab-35B-bf16exp-struct6 (struct 6-bit) with VQ experts.
+# Facts from config.json text_config + index total_size.
+
+[sampling_defaults]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+repetition_penalty = 1.0
+presence_penalty = 0.0

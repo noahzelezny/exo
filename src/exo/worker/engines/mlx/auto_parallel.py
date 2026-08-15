@@ -474,6 +474,10 @@ def tensor_auto_parallel(
     segments: int = 1
 
     def _all_to_sharded(path: str, weight: mx.array):
+        if path.endswith("codebook"):
+            # quantlab VQ: [K, d] codebook is a shared LUT — replicate, never
+            # slice (codes/vq_scales shard fine on the default axes)
+            return None
         if path.endswith("bias"):
             logger.info(f"Sharding bias for {path} - all to sharded")
             return weight.ndim - 1, segments
@@ -488,6 +492,9 @@ def tensor_auto_parallel(
     n = group.size()
 
     def _sharded_to_all(path: str, weight: mx.array):
+        if path.endswith("codebook"):
+            # quantlab VQ: replicate the LUT (see _all_to_sharded)
+            return None
         if path.endswith("bias"):
             logger.info(f"Sharding bias for {path} - sharded to all")
             weight /= n
