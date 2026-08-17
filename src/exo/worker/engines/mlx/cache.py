@@ -9,6 +9,7 @@ import psutil
 from mlx_lm.models.cache import (
     ArraysCache,
     CacheList,
+    ChunkedKVCache,
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
@@ -229,6 +230,43 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
     return any(is_non_trimmable_cache_entry(c) for c in cache)
 
 
+def chunked_rollback_ok(
+    cache: KVCacheType, tokens_to_trim: int, restore_pos: int
+) -> bool:
+    """Whether a pool restore is sound for every ChunkedKVCache entry.
+
+    ChunkedKVCache (llama4-style chunked attention) EVICTS history: at the
+    START of every forward, llama4 calls maybe_trim_front(), which drops the
+    buffer down to the last chunk_size columns and advances start_position —
+    computed from BUFFER geometry (keys.shape[2]), assuming offset sits near
+    the buffer end. A pool restore breaks that assumption, so a rollback is
+    only correct when, for every chunked entry:
+      1. the trim fits the logical window — ChunkedKVCache.trim() silently
+         CLAMPS to (offset - start_position), which would leave a cache whose
+         offset lies about its contents;
+      2. after the NEXT forward's trim-front (start_position advancing by
+         buf_len - chunk_size), the restore point's chunk is still fully
+         retained — otherwise continuation either attends to a chunk whose
+         earlier keys were evicted, or writes at a negative buffer index.
+    The dominant chat-append flow trims 0 tokens with the offset near the
+    buffer end and passes trivially; deep divergent-history rollbacks are
+    sent back to a fresh prefill.
+    """
+    for c in cache:
+        if not isinstance(c, ChunkedKVCache):
+            continue
+        window = c.offset - c.start_position
+        if tokens_to_trim > window:
+            return False
+        buf_len = c.keys.shape[2] if c.keys is not None else 0
+        start_after = c.start_position
+        if buf_len >= c.chunk_size:
+            start_after += buf_len - c.chunk_size
+        if start_after > (restore_pos // c.chunk_size) * c.chunk_size:
+            return False
+    return True
+
+
 class KVPrefixCache:
     def __init__(self, group: mx.distributed.Group | None):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
@@ -374,6 +412,15 @@ class KVPrefixCache:
 
         # No usable snapshot — need fresh cache
         if restore_snap is None and has_ssm:
+            return make_kv_cache(model), prompt_tokens, None, False
+
+        if not chunked_rollback_ok(
+            self.caches[best_index], cached_length - restore_pos, restore_pos
+        ):
+            logger.info(
+                f"prefix pool: chunked rollback unsafe for entry {best_index} "
+                f"(trim={cached_length - restore_pos}), prefilling fresh"
+            )
             return make_kv_cache(model), prompt_tokens, None, False
 
         prompt_cache = deepcopy(self.caches[best_index])
