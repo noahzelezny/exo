@@ -1,0 +1,22 @@
+model_id = "mlx-community/Llama-4-Scout-17B-16E-Instruct-8bit"
+n_layers = 48
+hidden_size = 5120
+num_key_value_heads = 8
+supports_tensor = false
+tasks = ["TextGeneration"]
+family = "llama"
+quantization = "8bit"
+base_model = "Llama 4 Scout"
+capabilities = ["text"]
+reasoning_dialect = "none"
+context_length = 10485760
+trust_remote_code = false
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
+
+[storage_size]
+in_bytes = 115434854619
+
+[sampling_defaults]
+# Llama 4 suggested defaults (generation_config.json)
+temperature = 0.6
+top_p = 0.9
