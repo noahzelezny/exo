@@ -30,6 +30,9 @@ from mlx_lm.models.gpt_oss import GptOssMoeModel
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.models.kimi_k25 import Model as KimiK25Model
 from mlx_lm.models.llama import Model as LlamaModel
+from mlx_lm.models.llama4 import MLP as Llama4MLP  # noqa: N811 - class, not a constant
+from mlx_lm.models.llama4 import Model as Llama4Model
+from mlx_lm.models.llama4 import MoE as Llama4MoE
 from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
 from mlx_lm.models.ministral3 import Model as Ministral3Model
@@ -505,6 +508,14 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
+    elif isinstance(model, Llama4Model):
+        tensor_parallel_sharding_strategy = Llama4ShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
     elif isinstance(model, (DeepseekV3Model, DeepseekV32Model, KimiK25Model)):
         tensor_parallel_sharding_strategy = DeepSeekShardingStrategy(
             group,
@@ -647,6 +658,56 @@ class LlamaShardingStrategy(TensorParallelShardingStrategy):
             layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
             layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
             mx.eval(layer)
+
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
+
+class Llama4ShardingStrategy(TensorParallelShardingStrategy):
+    """llama4 (Scout/Maverick): llama-style attention (q/k/v head-split,
+    o_proj gathered) + per-layer MoE of SwitchGLU experts and a shared
+    expert, both split on the intermediate dim like the Qwen MoEs, with one
+    all_sum over the block via ShardedMoE. The router stays replicated.
+    Chunked-attention masks and attn-temperature tuning are per-position,
+    not per-head, so head-splitting leaves them untouched. Maverick's dense
+    (non-MoE) layers take the plain MLP path.
+    """
+
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(Llama4Model, model)
+        total = len(model.layers)
+        for i, layer in enumerate(model.layers):
+            # Force load weights before sharding to avoid FAST_SYNCH deadlock
+            mx.eval(layer.parameters())
+            layer.self_attn.q_proj = self.all_to_sharded_linear(layer.self_attn.q_proj)
+            layer.self_attn.k_proj = self.all_to_sharded_linear(layer.self_attn.k_proj)
+            layer.self_attn.v_proj = self.all_to_sharded_linear(layer.self_attn.v_proj)
+            layer.self_attn.o_proj = self.sharded_to_all_linear(layer.self_attn.o_proj)
+            layer.self_attn.n_heads //= self.N
+            layer.self_attn.n_kv_heads //= self.N
+
+            if isinstance(layer.feed_forward, Llama4MoE):
+                moe = layer.feed_forward
+                self.all_to_sharded_linear_in_place(moe.experts.gate_proj)
+                self.sharded_to_all_linear_in_place(moe.experts.down_proj)
+                self.all_to_sharded_linear_in_place(moe.experts.up_proj)
+                self.all_to_sharded_linear_in_place(moe.shared_expert.gate_proj)
+                self.sharded_to_all_linear_in_place(moe.shared_expert.down_proj)
+                self.all_to_sharded_linear_in_place(moe.shared_expert.up_proj)
+                layer.feed_forward = ShardedMoE(moe)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+                layer.feed_forward.sharding_group = self.group
+            else:
+                assert isinstance(layer.feed_forward, Llama4MLP)
+                mlp = layer.feed_forward
+                mlp.gate_proj = self.all_to_sharded_linear(mlp.gate_proj)
+                mlp.down_proj = self.sharded_to_all_linear(mlp.down_proj)
+                mlp.up_proj = self.all_to_sharded_linear(mlp.up_proj)
+
+            mx.eval(layer)
+            mx.clear_cache()
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
