@@ -319,6 +319,11 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
         return [151336, 151329, 151338]
     elif "gpt-oss" in model_id_lower:
         return [200002, 200012]
+    elif "llama-4" in model_id_lower or "llama4" in model_id_lower:
+        # 200001 <|end_of_text|>, 200007 <|eom|> (tool handoff — without it a
+        # tool call runs away into self-conversation), 200008 <|eot|>.
+        # Matches the repo's generation_config.json eos_token_id list.
+        return [200001, 200007, 200008]
     elif (
         "qwen3.5" in model_id_lower
         or "qwen-3.5" in model_id_lower

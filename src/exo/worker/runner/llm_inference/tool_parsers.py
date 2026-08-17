@@ -11,6 +11,10 @@ class ToolParser:
     start_parsing: str
     end_parsing: str
     _inner_parser: Callable[[str], list[ToolCallItem] | None]
+    # Some models (llama4) emit tool calls BOTH wrapped in marker tokens and as
+    # bare JSON starting the message. When set, the extractor may open a
+    # capture on a first chunk that starts with "{" and decide at finish.
+    bare_json_start: bool = False
 
     def parse(
         self, text: str, tools: list[dict[str, Any]] | None
@@ -234,6 +238,43 @@ def make_json_parser() -> ToolParser:
         start_parsing="<tool_call>",
         end_parsing="</tool_call>",
         _inner_parser=_parse_json_calls,
+    )
+
+
+def make_llama4_parser() -> ToolParser:
+    """Llama 4 wraps tool calls as <|python_start|>{json}<|python_end|> with
+    {"type": "function", "name": ..., "parameters": {...}} payloads (observed
+    live on Llama-4-Scout-17B — mlx_lm's TokenizerWrapper has no tool tokens
+    for llama4, so without this the markup streams to the client as text).
+    OpenAI clients need name + arguments-as-string.
+    """
+
+    def parse(text: str) -> list[ToolCallItem] | None:
+        try:
+            text = text.removeprefix("<|python_start|>")
+            text = text.removesuffix("<|python_end|>")
+            obj = json.loads(text.strip())
+            calls: list[Any] = obj if isinstance(obj, list) else [obj]
+            items: list[ToolCallItem] = []
+            for c in calls:
+                if not isinstance(c, dict) or "name" not in c:
+                    return None
+                args = c.get("parameters", c.get("arguments", {}))
+                items.append(
+                    ToolCallItem(
+                        name=str(c["name"]),
+                        arguments=args if isinstance(args, str) else json.dumps(args),
+                    )
+                )
+            return items
+        except Exception:
+            return None
+
+    return ToolParser(
+        start_parsing="<|python_start|>",
+        end_parsing="<|python_end|>",
+        _inner_parser=parse,
+        bare_json_start=True,
     )
 
 

@@ -419,6 +419,11 @@ def parse_tool_calls(
     tools: list[dict[str, Any]] | None,
 ) -> Generator[GenerationResponse | ToolCallResponse | None]:
     in_tool_call = False
+    bare_mode = False
+    # llama4-style models emit calls both wrapped and as bare JSON opening the
+    # message; only the FIRST non-empty chunk may open a bare capture, and the
+    # verdict lands at finish (parse -> tool calls, else ordinary text).
+    may_sniff_bare = tool_parser.bare_json_start and tools is not None
     tool_call_text_parts: list[str] = []
     accumulated_tool_calls: list[ToolCallItem] = []
 
@@ -429,6 +434,12 @@ def parse_tool_calls(
 
         if not in_tool_call and response.text.startswith(tool_parser.start_parsing):
             in_tool_call = True
+            may_sniff_bare = False
+        elif not in_tool_call and may_sniff_bare and response.text.strip():
+            may_sniff_bare = False
+            if response.text.lstrip().startswith("{"):
+                in_tool_call = True
+                bare_mode = True
 
         if (
             not in_tool_call
@@ -463,6 +474,7 @@ def parse_tool_calls(
                 )
                 break
 
+            bare_mode = False
             accumulated_tool_calls.extend(parsed)
             if accumulated_tool_calls and (
                 response.finish_reason is not None or response.stats is not None
@@ -476,17 +488,40 @@ def parse_tool_calls(
             continue
 
         if response.finish_reason is not None:
+            combined = "".join(tool_call_text_parts)
+            in_tool_call = False
+            tool_call_text_parts = []
+            # The capture ended at eos rather than at the end marker (bare
+            # JSON call, or a wrapped call whose closer got cut). Try a real
+            # parse before declaring it broken.
+            parsed = tool_parser.parse(combined.strip(), tools=tools)
+            if parsed is not None:
+                accumulated_tool_calls.extend(parsed)
+                yield ToolCallResponse(
+                    tool_calls=accumulated_tool_calls,
+                    usage=response.usage,
+                    stats=response.stats,
+                )
+                accumulated_tool_calls.clear()
+                bare_mode = False
+                continue
+            if bare_mode:
+                # Sniffed text that turned out not to be a call — deliver it
+                # as ordinary content with its real finish reason.
+                logger.info("bare-json sniff was not a tool call; yielding as text")
+                yield response.model_copy(update={"text": combined, "token": 0})
+                bare_mode = False
+                continue
             logger.info(
                 "tool call parsing interrupted, yield partial tool call as text"
             )
-            response = response.model_copy(
+            yield response.model_copy(
                 update={
-                    "text": "".join(tool_call_text_parts),
+                    "text": combined,
                     "token": 0,
                     "finish_reason": "error",
                 }
             )
-            yield response
 
     if not accumulated_tool_calls:
         logger.warning("Tool calls should have all been emitted but were not")
