@@ -12,7 +12,7 @@ reasoning_dialect = "post_last_user"
 context_length = 262144
 backends = ["MlxMetal"]
 [storage_size]
-in_bytes = 103882022912
+in_bytes = 101108822016
 
 # VQLab VQ artifact (qwen4_exp), released 2026-08-30, HF twin of the local
 # dir qwen4exp_vq_packed_92mix6. Self-contained: the VQ runtime ships in the
@@ -22,8 +22,6 @@ in_bytes = 103882022912
 # — re-drop after any exo env rebuild. Tensor-parallel needs the codebook-
 # replicate guard in auto_parallel.py (upstream PR #2268). Vision tower
 # grafted bf16 (333 tensors); config carries vision_config + image_token_id.
-# 8-bit MTP graft included (disk-only; sanitized away by current
-# runtimes — resident size is the pre-graft figure).
 # Geometry: d2/K256 experts + d8/K4096 PLE, hot-6 layers at d2/K1024 (10-bit packed).
 # KL 50.3, top-1 92.8%. Fits 128GB boxes (94.1 GiB).
 
