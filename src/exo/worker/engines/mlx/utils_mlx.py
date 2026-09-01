@@ -39,6 +39,22 @@ import contextlib
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.utils import load_model
+
+# mlx-lm 0.31.x executes a config's `model_file` bundle unconditionally;
+# upstream later gated it behind a trust_remote_code kwarg on load_model
+# (absent in 0.31.x). Our VQ artifacts are self-contained bundles, so when
+# the pin moves past that gate, load_model must be told to trust them or
+# every VQ model dies at load with "requires importing and running a custom
+# module". Detect the kwarg once and thread the model card's existing
+# trust_remote_code flag (default True) through both load sites.
+import inspect as _inspect
+
+_LOAD_MODEL_HAS_TRC = "trust_remote_code" in _inspect.signature(load_model).parameters
+
+
+def _load_model_trusted(model_path: Path, *, trust_remote_code: bool):
+    kwargs = {"trust_remote_code": trust_remote_code} if _LOAD_MODEL_HAS_TRC else {}
+    return load_model(model_path, lazy=True, strict=False, **kwargs)
 from pydantic import RootModel
 
 from exo.download.download_utils import build_model_path
@@ -172,7 +188,10 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model(model_path, lazy=True, strict=False)
+        model, _ = _load_model_trusted(
+            model_path,
+            trust_remote_code=bound_instance.bound_shard.model_card.trust_remote_code,
+        )
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -235,7 +254,10 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, _ = _load_model_trusted(
+        model_path,
+        trust_remote_code=shard_metadata.model_card.trust_remote_code,
+    )
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass
@@ -767,6 +789,21 @@ def apply_chat_template(
     task_params: TextGenerationTaskParams,
 ) -> str:
     messages: list[dict[str, ChatTemplateValue]] = []
+    # RAW SCORING ESCAPE HATCH (2026-08-12). echo_score is reachable only via
+    # /v1/chat/completions, so a scored corpus was ALWAYS wrapped in the chat
+    # template — and that does not merely add ~9 wrapper tokens, it reframes
+    # every corpus token as content inside a user turn and changes each
+    # prediction. Measured on the 35B pair: raw 4.865 / 5.555 vs chat-wrapped
+    # 11.012 / 9.265 — the two metrics RANK QUANTS DIFFERENTLY, and the
+    # "perplexity" people expect in a model card is the RAW one. A scoring
+    # prompt that begins with this sentinel is therefore scored as bare text,
+    # which is the only way to measure the standard metric on a model too big
+    # for any single box. exo's scoring MATH was never wrong: the chat path
+    # reproduces local mlx_lm to within 0.5%.
+    if getattr(task_params, "echo_score", False) and task_params.input:
+        first = task_params.input[0].content
+        if isinstance(first, str) and first.startswith("<|RAW_SCORE|>"):
+            return first[len("<|RAW_SCORE|>"):]
     if task_params.chat_template_messages is not None:
         # Use pre-formatted messages that preserve tool_calls, thinking, etc.
         messages = task_params.chat_template_messages
