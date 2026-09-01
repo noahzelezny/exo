@@ -8,8 +8,14 @@ ran away re-emitting the same call as fresh assistant turns.
 """
 
 import json
+from collections.abc import Generator as _Gen
 
+from exo.shared.types.worker.runner_response import (
+    GenerationResponse,
+    ToolCallResponse,
+)
 from exo.worker.engines.mlx.utils_mlx import get_eos_token_ids_for_model
+from exo.worker.runner.llm_inference.model_output_parsers import parse_tool_calls
 from exo.worker.runner.llm_inference.tool_parsers import make_llama4_parser
 
 CALL = '{"type": "function", "name": "recall_transcript", "parameters": {"session": "last"}}'
@@ -66,14 +72,6 @@ def test_llama4_eos_includes_eom_and_eot():
 
 
 # --- streaming extraction: llama4 emits calls wrapped AND as bare JSON -------
-
-from collections.abc import Generator as _Gen
-
-from exo.shared.types.worker.runner_response import (
-    GenerationResponse,
-    ToolCallResponse,
-)
-from exo.worker.runner.llm_inference.model_output_parsers import parse_tool_calls
 
 _TOOLS = [
     {

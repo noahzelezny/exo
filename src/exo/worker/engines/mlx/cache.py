@@ -1,3 +1,4 @@
+import contextlib
 import gc
 import os
 from copy import deepcopy
@@ -373,10 +374,8 @@ class KVPrefixCache:
     def _pool_tokens(self) -> int:
         total = 0
         for p in self.prompts:
-            try:
+            with contextlib.suppress(Exception):
                 total += len(p)
-            except Exception:
-                pass
         return total
 
     def _log_pool(self, event: str, **extra: object) -> None:

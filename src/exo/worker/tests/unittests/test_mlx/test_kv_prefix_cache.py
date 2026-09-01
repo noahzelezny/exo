@@ -114,8 +114,8 @@ def test_thin_snapshots_bounds_snapshot_memory():
     so memory is O(context) and any restore target stays within ~2x of a kept
     snapshot."""
     from exo.worker.engines.mlx.cache import (
-        CacheSnapshot,
         _MAX_SNAPSHOTS_PER_ENTRY,
+        CacheSnapshot,
         _thin_snapshots,
     )
 

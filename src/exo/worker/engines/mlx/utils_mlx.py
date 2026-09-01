@@ -35,26 +35,11 @@ try:
 except ImportError:
     from mlx_lm.tokenizer_utils import load as load_tokenizer
 import contextlib
+import inspect
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.utils import load_model
-
-# mlx-lm 0.31.x executes a config's `model_file` bundle unconditionally;
-# upstream later gated it behind a trust_remote_code kwarg on load_model
-# (absent in 0.31.x). Our VQ artifacts are self-contained bundles, so when
-# the pin moves past that gate, load_model must be told to trust them or
-# every VQ model dies at load with "requires importing and running a custom
-# module". Detect the kwarg once and thread the model card's existing
-# trust_remote_code flag (default True) through both load sites.
-import inspect as _inspect
-
-_LOAD_MODEL_HAS_TRC = "trust_remote_code" in _inspect.signature(load_model).parameters
-
-
-def _load_model_trusted(model_path: Path, *, trust_remote_code: bool):
-    kwargs = {"trust_remote_code": trust_remote_code} if _LOAD_MODEL_HAS_TRC else {}
-    return load_model(model_path, lazy=True, strict=False, **kwargs)
 from pydantic import RootModel
 
 from exo.download.download_utils import build_model_path
@@ -82,6 +67,21 @@ from exo.worker.engines.mlx.auto_parallel import (
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
+
+# mlx-lm 0.31.x executes a config's `model_file` bundle unconditionally;
+# upstream later gated it behind a trust_remote_code kwarg on load_model
+# (absent in 0.31.x). Our VQ artifacts are self-contained bundles, so when
+# the pin moves past that gate, load_model must be told to trust them or
+# every VQ model dies at load with "requires importing and running a custom
+# module". Detect the kwarg once and thread the model card's existing
+# trust_remote_code flag (default True) through both load sites.
+_LOAD_MODEL_HAS_TRC = "trust_remote_code" in inspect.signature(load_model).parameters
+
+
+def _load_model_trusted(model_path: Path, *, trust_remote_code: bool):
+    kwargs = {"trust_remote_code": trust_remote_code} if _LOAD_MODEL_HAS_TRC else {}
+    return load_model(model_path, lazy=True, strict=False, **kwargs)
+
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:

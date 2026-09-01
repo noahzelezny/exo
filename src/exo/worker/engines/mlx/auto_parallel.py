@@ -30,7 +30,7 @@ from mlx_lm.models.gpt_oss import GptOssMoeModel
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.models.kimi_k25 import Model as KimiK25Model
 from mlx_lm.models.llama import Model as LlamaModel
-from mlx_lm.models.llama4 import MLP as Llama4MLP
+from mlx_lm.models.llama4 import MLP as Llama4MLP  # noqa: N811
 from mlx_lm.models.llama4 import Model as Llama4Model
 from mlx_lm.models.llama4 import MoE as Llama4MoE
 from mlx_lm.models.minimax import MiniMaxAttention

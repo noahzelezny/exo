@@ -484,8 +484,8 @@ class BatchGenerator(Engine):
         self, task: TextGeneration
     ) -> Iterator[tuple[TaskId, GenerationChunk | FinishedResponse]]:
         """Score the prompt (see TextGenerationTaskParams.echo_score)."""
-        from exo.worker.engines.mlx.generator.generate import _echo_score
         from exo.worker.engines.mlx.cache import encode_prompt
+        from exo.worker.engines.mlx.generator.generate import _echo_score
 
         prompt = apply_chat_template(self.tokenizer, task.task_params)
         toks = encode_prompt(self.tokenizer, prompt)

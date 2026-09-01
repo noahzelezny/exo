@@ -299,6 +299,9 @@ def main():
     logger.info(f"EXO_LIBP2P_NAMESPACE: {os.getenv('EXO_LIBP2P_NAMESPACE')}")
 
     if args.offline:
+        # Export for library code far from the arg parser (e.g. model_cards'
+        # trust-local-config path gates on this).
+        os.environ["EXO_OFFLINE"] = "true"
         logger.info("Running in OFFLINE mode — no internet checks, local models only")
 
     if args.bootstrap_peers:

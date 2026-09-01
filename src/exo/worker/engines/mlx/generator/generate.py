@@ -52,7 +52,6 @@ from exo.worker.engines.mlx.cache import (
 )
 from exo.worker.engines.mlx.constants import (
     DEFAULT_TOP_LOGPROBS,
-    KV_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
     kv_bits_for,

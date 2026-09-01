@@ -1,4 +1,5 @@
 import json
+import os
 from enum import Enum
 from typing import Annotated, Any
 
@@ -31,6 +32,11 @@ from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
 from exo.shared.types.text_generation import ReasoningDialect
 from exo.utils.pydantic_ext import FrozenModel
+
+
+def _offline_mode() -> bool:
+    return os.environ.get("EXO_OFFLINE", "false").lower() == "true"
+
 
 # kinda ugly...
 # TODO: load search path from config.toml
@@ -358,7 +364,7 @@ async def fetch_config_data(model_id: ModelId) -> ConfigData:
     # field type mismatch against the installed transformers — must survive
     # exo's size-mismatch re-download in offline operation).
     local_config = target_dir / "config.json"
-    if await aios.path.exists(local_config):
+    if _offline_mode() and await aios.path.exists(local_config):
         config_path = local_config
     else:
         config_path = await download_file_with_retry(
@@ -392,7 +398,7 @@ async def fetch_safetensors_size(model_id: ModelId) -> Memory:
     # variant (wrong total_size + shard list); in offline/air-gapped operation
     # the local corrected copy must win. Only fetch when no local index exists.
     local_index = target_dir / "model.safetensors.index.json"
-    if await aios.path.exists(local_index):
+    if _offline_mode() and await aios.path.exists(local_index):
         index_path = local_index
     else:
         index_path = await download_file_with_retry(

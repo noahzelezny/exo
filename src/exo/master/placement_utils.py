@@ -388,14 +388,14 @@ def find_ip_prioritised(
         # and trips the macOS GPU command-buffer watchdog mid-decode,
         # SIGABRT-ing the runner. RDMA (MlxJaccl) is the "real" fix but
         # is unreliable on this cluster due to asymmetric M3/M4 compute
-        # speeds (race conditions), so we pin every ring leg to the known
-        # point-to-point TB4 subnet instead. Override the prefix via the
-        # EXO_RING_PREFER_SUBNET env var.
-        _tb_subnet = os.environ.get("EXO_RING_PREFER_SUBNET", "10.0.0.")
+        # speeds (race conditions). Setting EXO_RING_PREFER_SUBNET to an IP
+        # prefix (e.g. "10.0.0.") pins every ring leg to that subnet; unset,
+        # the normal interface-type priority applies.
+        _tb_subnet = os.environ.get("EXO_RING_PREFER_SUBNET", "")
         return min(
             ips,
             key=lambda ip: -1
-            if ip.startswith(_tb_subnet)
+            if _tb_subnet and ip.startswith(_tb_subnet)
             else priority.get(ip_to_type.get(ip, "unknown"), 2),
         )
 
@@ -413,16 +413,16 @@ def find_ip_prioritised(
     # 0.33ms jitter, SHARED with all home-network traffic, vs the TB4 bridge's
     # 0.43ms / 0.06ms on a dedicated point-to-point cable. So the lightweight
     # rendezvous/gossip used to ride the splitter and was exposed to network
-    # contention. Pin the coordinator to the same TB4 subnet the ring already
-    # uses (EXO_RING_PREFER_SUBNET) so it rides the dedicated link instead. That
+    # contention. EXO_RING_PREFER_SUBNET (opt-in, same var the ring uses) pins
+    # the coordinator to a dedicated subnet so it rides that link instead. That
     # subnet (10.0.0.x, en4/en3) is SEPARATE from the raw RDMA ifaces (10.0.1.x,
     # en7/en2), so this keeps the coordinator off the RDMA link too — honoring
     # the ethernet-coordinator intent while dropping the home-LAN dependency.
-    _tb_subnet = os.environ.get("EXO_RING_PREFER_SUBNET", "10.0.0.")
+    _tb_subnet = os.environ.get("EXO_RING_PREFER_SUBNET", "")
     return min(
         ips,
         key=lambda ip: -1
-        if ip.startswith(_tb_subnet)
+        if _tb_subnet and ip.startswith(_tb_subnet)
         else priority.get(ip_to_type.get(ip, "unknown"), 2),
     )
 
