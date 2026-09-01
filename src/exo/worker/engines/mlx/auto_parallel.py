@@ -59,6 +59,11 @@ from mlx_lm.models.qwen3_next import (
     Qwen3NextSparseMoeBlock,
 )
 from mlx_lm.models.qwen3_next import Qwen3NextModel as Qwen3NextInnerModel
+
+try:  # qwen4_exp exists only in mlx-lm builds carrying upstream PR #1788
+    from mlx_lm.models.qwen4_exp import Qwen4ExpModel as Qwen4ExpInnerModel
+except ImportError:
+    Qwen4ExpInnerModel = None  # type: ignore[assignment,misc]
 from mlx_lm.models.qwen3_vl import Model as Qwen3VLModel
 from mlx_lm.models.step3p5 import Model as Step35Model
 from mlx_lm.models.step3p5 import Step3p5MLP as Step35MLP
@@ -388,6 +393,27 @@ def pipeline_auto_parallel(
                 ssm_idx=inner_model_instance.ssm_idx,
                 has_linear=has_mamba,
             )
+
+    if Qwen4ExpInnerModel is not None and isinstance(
+        inner_model_instance, Qwen4ExpInnerModel
+    ):
+        # The inner model derives full_idx / lin_idx from its (now sliced)
+        # layer list at call time, so those stay consistent for free — but the
+        # outer Model.make_cache builds one entry per FULL-model layer from
+        # args.text.layer_types, and ple_layers holds full-model indices.
+        # Slice both to the shard, or cache[full_idx[0]] lands on a recurrent
+        # _LayerCache whose make_mask rejects create_attention_mask's kwargs.
+        inner_model_instance.ple_layers = [
+            i - start_layer
+            for i in inner_model_instance.ple_layers
+            if start_layer <= i < end_layer
+        ]
+        _q4_orig_make_cache = model.make_cache  # type: ignore[attr-defined]
+
+        def _q4_sliced_make_cache() -> list[object]:
+            return _q4_orig_make_cache()[start_layer:end_layer]  # type: ignore[no-any-return]
+
+        model.make_cache = _q4_sliced_make_cache  # type: ignore[attr-defined]
 
     _set_layers(model, layers)
 
