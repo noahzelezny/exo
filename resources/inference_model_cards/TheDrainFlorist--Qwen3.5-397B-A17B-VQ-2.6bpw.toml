@@ -1,0 +1,33 @@
+model_id = "TheDrainFlorist/Qwen3.5-397B-A17B-VQ-2.6bpw"
+n_layers = 60
+hidden_size = 4096
+num_key_value_heads = 2
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "qwen"
+quantization = "vq-2.6bpw"
+base_model = "Qwen3.5 397B A17B"
+capabilities = ["text", "thinking", "thinking_toggle", "vision"]
+reasoning_dialect = "post_last_user"
+context_length = 262144
+backends = ["MlxMetal"]
+[storage_size]
+in_bytes = 131324114662
+
+# Vector-quantized MoE experts. Loads on stock mlx-lm via the bundled
+# model.py (config.json model_file). Includes the vision tower.
+
+[sampling_defaults]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+repetition_penalty = 1.0
+presence_penalty = 0.0
+
+# ADDED 2026-08-26. This published rung (flat d4/K512, E93) had no exo card at
+# all, so exo could not resolve it while every other 397B rung could.
+# storage_size = .safetensors total, verified against the live repo:
+# 131,324,114,662 = 122.3051 GiB. pack_bits=9 (K=512 is NOT byte-aligned).
+# Codebook is 4,096 B, inside the 32 KB cap -- flat-kernel path, like the
+# other d4 rungs. Tensor-parallel needs the codebook-replicate guard.
