@@ -245,6 +245,13 @@ extend-exclude = [".typings/**", "rust/exo_pyo3_bindings/**", "bench/vendor/**"]
 [tool.ruff.lint]
 extend-select = ["I", "N", "B", "A", "PIE", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# Vendored verbatim from VQLab's vqlab.mtp package (see mtp/__init__.py
+# for provenance). Kept byte-identical to upstream so the single-box
+# reference and this copy never diverge; style rules stay upstream's.
+"src/exo/worker/engines/mlx/mtp/{capture,caches,sampling,loop,registry}.py" = ["I", "N", "B", "E741", "F401"]
+"src/exo/worker/engines/mlx/mtp/heads/*.py" = ["I", "N", "B", "E741", "F401"]
+
 [tool.pytest.ini_options]
 pythonpath = "."
 asyncio_mode = "auto"

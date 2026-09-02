@@ -58,6 +58,7 @@ from exo.worker.engines.mlx.constants import (
     prefill_step_size_for,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.mtp.speculative import maybe_mtp_head, mtp_responses
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -736,6 +737,18 @@ def mlx_generate(
     if not task.use_prefix_cache:
         kv_prefix_cache = None
 
+    # MTP speculative drafting (stage 0: single node, default-off behind
+    # EXO_MTP=1). When a head loads, the mtp loop owns prefill — it must
+    # seed the head with per-position hidden states from position 0, which
+    # a reused pool prefix cannot provide — so the request bypasses the
+    # prefix pool entirely (same call vqlab/serve.py makes). Stage 0.5
+    # pairs a head cache with each pooled prefix and lifts this.
+    mtp_head = maybe_mtp_head(
+        model, task.model, group, has_vision=vision is not None
+    )
+    if mtp_head is not None:
+        kv_prefix_cache = None
+
     # Use prefix cache if available, otherwise create fresh cache
     prefix_hit_length = 0
     matched_index: int | None = None
@@ -797,7 +810,8 @@ def mlx_generate(
         else contextlib.nullcontext()
     )
     use_remote = (
-        len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
+        mtp_head is None
+        and len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
         and task.prefill_endpoint is not None
     )
     remote_prefilled = False
@@ -821,7 +835,7 @@ def mlx_generate(
                 logger.opt(exception=True).warning(
                     "Remote prefill failed, falling back to local prefill"
                 )
-        if not remote_prefilled:
+        if not remote_prefilled and mtp_head is None:
             prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
                 model,
                 tokenizer,
@@ -878,8 +892,26 @@ def mlx_generate(
     logger.info("Starting decode")
     mx_barrier(group)
 
-    for completion_tokens, out in enumerate(
-        stream_generate(
+    if mtp_head is not None:
+        # The mtp loop owns prefill (head seeding needs every position's
+        # hidden state), so it takes the FULL prompt and the fresh cache.
+        # SpecResponse is duck-compatible with the GenerationResponse
+        # fields the loop below reads.
+        response_stream = mtp_responses(
+            model,
+            tokenizer,
+            all_prompt_tokens,
+            mtp_head,
+            max_tokens=max_tokens,
+            temp=task.temperature if task.temperature is not None else 0.7,
+            top_p=task.top_p if task.top_p is not None else 1.0,
+            min_p=task.min_p if task.min_p is not None else 0.05,
+            top_k=task.top_k if task.top_k is not None else 0,
+            logits_processors=logits_processors,
+            prefill_step_size=prefill_step_size_for(task.model),
+        )
+    else:
+        response_stream = stream_generate(
             model=model,
             tokenizer=tokenizer,
             prompt=last_token,
@@ -890,7 +922,10 @@ def mlx_generate(
             prefill_step_size=1,
             kv_group_size=KV_GROUP_SIZE,
             kv_bits=kv_bits,
-        ),
+        )
+
+    for completion_tokens, out in enumerate(
+        response_stream,
         start=1,
     ):
         generated_text_parts.append(out.text)
