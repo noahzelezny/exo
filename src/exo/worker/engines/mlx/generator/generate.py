@@ -250,6 +250,15 @@ def pipeline_parallel_prefill(
                     distributed_prompt_progress_callback()
 
                 flush_prefill_sends()
+                # Force each chunk's graph NOW, as upstream mlx_lm's prefill
+                # does. Without this the last pipeline rank (whose outputs feed
+                # no sends) lazily accumulates the ENTIRE prompt's graph and
+                # only evaluates at the post-loop eval -- transient memory
+                # proportional to prompt length, tens of GB on recurrent
+                # models (measured: +56 GiB on the fat-shard box for a 6.9k
+                # prompt on GLM-5.3, OOMing the pair).
+                mx.eval([c.state for c in _prompt_cache])  # type: ignore
+                mx.clear_cache()
 
                 prompt_progress_callback(processed, total)
 
