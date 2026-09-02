@@ -54,9 +54,18 @@ def kv_bits_for(model_id: str | None) -> int | None:
     """
     if not model_id:
         return KV_BITS
-    if "DeepSeek-V4" in model_id:
-        return 8
+    lowered = model_id.lower()
+    for family, bits in KV_BITS_BY_FAMILY.items():
+        if family in lowered:
+            return bits
     return KV_BITS
+
+
+# Per-FAMILY KV-bits overrides; evidence in the kv_bits_for docstring.
+# Key: lowercase substring matched against the model id.
+KV_BITS_BY_FAMILY: dict[str, int] = {
+    "deepseek-v4": 8,
+}
 
 # Per-FAMILY prefill chunk-size overrides (tokens per prefill chunk).
 # Key: lowercase substring matched against the model id. Value: chunk size
