@@ -55,6 +55,7 @@ from exo.worker.engines.mlx.constants import (
     KV_GROUP_SIZE,
     MAX_TOKENS,
     kv_bits_for,
+    prefill_step_size_for,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -299,6 +300,7 @@ def prefill(
     on_prefill_progress: Callable[[int, int], None] | None,
     distributed_prompt_progress_callback: Callable[[], None] | None,
     kv_bits: int | None = None,
+    step_size_override: int | None = None,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
@@ -362,14 +364,13 @@ def prefill(
     prefill_step_size_env = os.getenv("EXO_PREFILL_STEP_SIZE")
     if prefill_step_size_env is not None:
         prefill_step_size = int(prefill_step_size_env)
-    elif has_ssm:
-        # Recurrent models (GLM-5.3's 34 deltanet layers, qwen3-next family)
-        # hold per-token recurrent intermediates in the lazy graph across a
-        # chunk, so their prefill transient scales with chunk_size times the
-        # per-layer STATE size, not the KV row -- measured OOMing BOTH boxes
-        # of a 224GB pair on a 135GB model at 4096. 512 caps the transient at
-        # roughly 1/8th for a few percent of prefill wall time.
-        prefill_step_size = 512
+    elif step_size_override is not None:
+        # Per-model table in ../constants.py (prefill_step_size_for). A
+        # blanket has_ssm->512 heuristic here regressed qwen4_exp (its
+        # PLE/deltanet ArraysCache entries triggered it) to unusably slow
+        # prefill; only models with MEASURED fat recurrent state get small
+        # chunks.
+        prefill_step_size = step_size_override
     else:
         prefill_step_size = 4096
 
@@ -817,6 +818,7 @@ def mlx_generate(
                 on_prefill_progress,
                 distributed_prompt_progress_callback,
                 kv_bits=kv_bits,
+                step_size_override=prefill_step_size_for(task.model),
             )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 

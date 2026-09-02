@@ -58,6 +58,36 @@ def kv_bits_for(model_id: str | None) -> int | None:
         return 8
     return KV_BITS
 
+def prefill_step_size_for(model_id: str | None) -> int | None:
+    """Per-model prefill chunk-size override (tokens per prefill chunk).
+
+    Returns the chunk size to use instead of the 4096 upstream default, or
+    None to keep the default. EXO_PREFILL_STEP_SIZE still wins over both.
+
+    Like `kv_bits_for`, entries are empirical and must cite the evidence:
+
+    Confirmed-needed small chunks:
+      - GLM-5.3 family : 34 deltanet layers hold per-token recurrent
+        intermediates in the lazy graph across a chunk, so the prefill
+        transient scales with chunk_size x per-layer STATE size
+        (16.8MB/layer), not the KV row. 2026-09-01: OOMed BOTH boxes of a
+        224GB pair on the 135GB 3.6bpw at 4096; 512 caps the transient.
+
+    Confirmed-hurt by small chunks (keep None):
+      - Qwen3.5-397B (qwen4_exp) : also has ArraysCache entries (deltanet
+        + PLE slots), so any "has SSM caches" heuristic catches it — but
+        its recurrent state is small and it served 4096-token chunks for
+        weeks. 2026-09-02: a blanket SSM->512 default made its prefill
+        unusably slow (8x the chunks, each with a blocking per-chunk eval
+        over the TCP ring). This per-model table replaces that heuristic.
+    """
+    if not model_id:
+        return None
+    if "glm-5.3" in model_id.lower():
+        return 512
+    return None
+
+
 DEFAULT_TOP_LOGPROBS: int = 5
 
 # TODO: We should really make this opt-in, but Kimi requires trust_remote_code=True
