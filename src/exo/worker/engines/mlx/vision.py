@@ -427,7 +427,11 @@ class VisionEncoder:
         if not safetensors_files:
             raise FileNotFoundError(f"No safetensors files found in {self._model_path}")
 
-        vision_prefixes = ["vision_tower.", "model.visual."]
+        # "vision_model." is mlx_vlm-native naming (e.g. glm5_next artifacts
+        # packed from an mlx_vlm checkpoint: vision_model.patch_embed.*,
+        # vision_model.blocks.*, vision_model.merger.*). Keys are already in
+        # the VisionModel's own layout, so no sanitize pass is needed.
+        vision_prefixes = ["vision_tower.", "model.visual.", "vision_model."]
         projector_prefixes = [
             "embed_vision.",
             "multi_modal_projector.",
