@@ -133,6 +133,7 @@ def mlx_distributed_init(
                 os.environ["MLX_RANK"] = str(rank)
                 os.environ["MLX_RING_VERBOSE"] = "1"  # Scout 2026-05-18: debug ring connect
 
+                os.environ["EXO_INTERCONNECT"] = "ring"
                 group = mx.distributed.init(backend="ring", strict=True)
 
             case MlxJacclInstance(
@@ -156,6 +157,7 @@ def mlx_distributed_init(
                 os.environ["MLX_IBV_DEVICES"] = coordination_file
                 os.environ["MLX_RANK"] = str(rank)
                 os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
+                os.environ["EXO_INTERCONNECT"] = "jaccl"
                 group = mx.distributed.init(backend="jaccl", strict=True)
 
         logger.info(f"Rank {rank} mlx distributed initialization complete")
@@ -314,7 +316,15 @@ def shard_and_load(
     # and aborts placement). Now decode collectives finish in ms, so a small
     # deadline catches a real wedge fast. Requires the live-getenv mlx (jaccl reads
     # the env per collective). Off unless EXO_JACCL_DECODE_TIMEOUT_MS > 0.
+    # The deadline is a JACCL (RDMA) self-heal: jaccl reads
+    # JACCL_COLLECTIVE_TIMEOUT_MS per collective and aborts a wedged ring.
+    # NEVER arm it on the TCP ring backend: there a big prefill legitimately
+    # holds a collective open longer than any sane wedge deadline (the slow
+    # box computes its shard between exchanges), and the timeout executes a
+    # healthy instance mid-prefill. TCP rings have the errno-54 watchdog.
     _decode_timeout = os.environ.get("EXO_JACCL_DECODE_TIMEOUT_MS", "0")
+    if os.environ.get("EXO_INTERCONNECT") != "jaccl":
+        _decode_timeout = "0"
     try:
         if int(_decode_timeout) > 0:
             os.environ["JACCL_COLLECTIVE_TIMEOUT_MS"] = _decode_timeout

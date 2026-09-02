@@ -340,7 +340,19 @@ def prefill(
     # Lowering this shrinks the spike so V4 survives much longer contexts
     # (slower prefill — more chunks — but works at all). Env-tunable; the 4096
     # default preserves upstream behavior until EXO_PREFILL_STEP_SIZE is set.
-    prefill_step_size = int(os.getenv("EXO_PREFILL_STEP_SIZE", "4096"))
+    prefill_step_size_env = os.getenv("EXO_PREFILL_STEP_SIZE")
+    if prefill_step_size_env is not None:
+        prefill_step_size = int(prefill_step_size_env)
+    elif has_ssm:
+        # Recurrent models (GLM-5.3's 34 deltanet layers, qwen3-next family)
+        # hold per-token recurrent intermediates in the lazy graph across a
+        # chunk, so their prefill transient scales with chunk_size times the
+        # per-layer STATE size, not the KV row -- measured OOMing BOTH boxes
+        # of a 224GB pair on a 135GB model at 4096. 512 caps the transient at
+        # roughly 1/8th for a few percent of prefill wall time.
+        prefill_step_size = 512
+    else:
+        prefill_step_size = 4096
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
