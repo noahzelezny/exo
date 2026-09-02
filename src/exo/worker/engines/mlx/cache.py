@@ -1,6 +1,7 @@
 import contextlib
 import gc
 import os
+from copy import copy as _shallow_copy
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
@@ -199,6 +200,21 @@ def _copy_v4_cache(c: DeepseekV4Cache) -> DeepseekV4Cache:
     return snap
 
 
+def _duck_copy_cache(entry: object) -> object:
+    """Snapshot a cache entry of a class this module doesn't know (e.g.
+    mlx_vlm's ArraysCache, which glm5_next builds for its recurrent layers).
+    Shallow-copy the object and detach its array-list state; mlx arrays are
+    immutable, so everything else is safe to share."""
+    dup = _shallow_copy(entry)
+    cache_list = getattr(dup, "cache", None)
+    if isinstance(cache_list, list):
+        dup.cache = [  # type: ignore[attr-defined]
+            _detached_copy(v) if isinstance(v, mx.array) else v
+            for v in cache_list
+        ]
+    return dup
+
+
 def copy_snapshot_entry(
     entry: ArraysCache | RotatingKVCache | CacheList | DeepseekV4Cache | None,
 ) -> ArraysCache | RotatingKVCache | CacheList | DeepseekV4Cache | None:
@@ -214,6 +230,8 @@ def copy_snapshot_entry(
             return _copy_cache_list(entry)
         case DeepseekV4Cache():
             return _copy_v4_cache(entry)
+        case _:
+            return _duck_copy_cache(entry)  # type: ignore[return-value]
 
 
 def snapshot_ssm_states(cache: KVCacheType) -> CacheSnapshot:
@@ -229,6 +247,11 @@ def snapshot_ssm_states(cache: KVCacheType) -> CacheSnapshot:
             states.append(_copy_cache_list(c))
         elif isinstance(c, DeepseekV4Cache):
             states.append(_copy_v4_cache(c))
+        elif is_non_trimmable_cache_entry(c):
+            # Unknown non-trimmable class (mlx_vlm caches): duck-copy, or the
+            # restore branch in generate.py finds None and silently keeps the
+            # un-rolled-back recurrent state -- phantom trailing tokens.
+            states.append(_duck_copy_cache(c))  # type: ignore[arg-type]
         else:
             states.append(None)
     token_count = cache_length(cache)
