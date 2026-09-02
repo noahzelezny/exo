@@ -326,6 +326,16 @@ def prefill(
         )
         if has_ssm:
             snapshots.append(snapshot_ssm_states(cache))
+            # Every chunk snapshots the shard's full recurrent state and the
+            # list is retained for the whole prefill; on wide-state models
+            # (GLM-5.3: 64 heads x 256-dim V = 16.8MB/layer) a long prompt
+            # accumulates gigabytes. Rollback and prefix-restore only need
+            # the NEAREST snapshot at-or-before a position, so thin the
+            # history: past 16 entries, drop every other one among the older
+            # half. Coarser prefix restore, identical correctness.
+            if len(snapshots) > 16:
+                half = len(snapshots) // 2
+                del snapshots[1:half:2]
 
         if on_prefill_progress is not None:
             on_prefill_progress(processed, total)
