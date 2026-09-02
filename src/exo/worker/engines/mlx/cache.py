@@ -519,8 +519,10 @@ class KVPrefixCache:
         is_exact = False
 
         # Find best cache match
+        raw_length = 0
         for i, cached_prompt in enumerate(self.prompts):
             length = get_prefix_length(prompt_tokens, cached_prompt)
+            raw_length = max(raw_length, length)
             if length > 0:
                 length = self._validate_media_match(
                     length,
@@ -548,6 +550,20 @@ class KVPrefixCache:
             desired = (max_length - 1) if is_exact else best_length
             target = min(cached_length, desired)
         restore_pos, restore_snap = self._get_snapshot(best_index, target)
+        # Every truncated hit has exactly one cause; make the log name it.
+        # raw = token prefix match before media validation; target vs
+        # restore_pos separates a short MATCH from missing SNAPSHOT coverage.
+        snaps = self._snapshots[best_index]
+        self._log_pool(
+            "match",
+            idx=best_index,
+            raw=raw_length,
+            matched=best_length,
+            target=target,
+            restore=restore_pos,
+            snap_tcs=[s.token_count for s in snaps] if snaps else [],
+            exact=is_exact,
+        )
 
         # No usable snapshot — need fresh cache
         if restore_snap is None and has_ssm:
