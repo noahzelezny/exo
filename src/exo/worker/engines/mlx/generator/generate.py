@@ -909,6 +909,7 @@ def mlx_generate(
             top_k=task.top_k if task.top_k is not None else 0,
             logits_processors=logits_processors,
             prefill_step_size=prefill_step_size_for(task.model),
+            want_logprobs=bool(task.logprobs),
         )
     else:
         response_stream = stream_generate(

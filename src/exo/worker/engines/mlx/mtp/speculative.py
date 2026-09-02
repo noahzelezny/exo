@@ -97,12 +97,14 @@ class SpecResponse:
     """Duck-compatible with the mlx_lm GenerationResponse fields exo reads."""
 
     text: str
+    token: int
     finish_reason: str | None
     prompt_tokens: int
     prompt_tps: float
     generation_tokens: int
     generation_tps: float
     peak_memory: float
+    logprobs: mx.array | None = None
     from_draft: bool = False
     acceptance: float = 0.0
 
@@ -120,6 +122,7 @@ def mtp_responses(
     top_k: int,
     logits_processors: list[Callable[..., Any]] | None,
     prefill_step_size: int | None,
+    want_logprobs: bool = False,
 ) -> Generator[SpecResponse, None, None]:
     """mtp_stream_generate adapted to the stream exo's decode loop consumes.
 
@@ -152,6 +155,7 @@ def mtp_responses(
         top_k=top_k,
         logits_processors=logits_processors,
         prefill_step_size=prefill_step_size or 2048,
+        want_logprobs=want_logprobs,
     ):
         if first_token_at is None:
             first_token_at = time.perf_counter()
@@ -159,6 +163,8 @@ def mtp_responses(
         final_acceptance = r.acceptance
         resp = SpecResponse(
             text=r.text,
+            token=r.token,
+            logprobs=r.logprobs,
             finish_reason=None,
             prompt_tokens=n_prompt,
             prompt_tps=n_prompt / prompt_time,
