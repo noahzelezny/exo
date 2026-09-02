@@ -299,7 +299,20 @@ def is_non_trimmable_cache_entry(c: object) -> bool:
         return True
     if isinstance(c, CacheList):
         return not bool(c.is_trimmable())  # type: ignore[reportUnknownMemberType]
-    return isinstance(c, DeepseekV4Cache)
+    if isinstance(c, DeepseekV4Cache):
+        return True
+    # Duck-type the rest: mlx_vlm ships its OWN cache classes (e.g.
+    # mlx_vlm.models.cache.ArraysCache for glm5_next's recurrent layers),
+    # which fail every isinstance above, take the trim() branch, and raise.
+    # An entry that says it isn't trimmable, or that has no trim() at all,
+    # cannot take that branch -- whatever package it came from.
+    is_trimmable = getattr(c, "is_trimmable", None)
+    if callable(is_trimmable):
+        try:
+            return not bool(is_trimmable())
+        except Exception:
+            return True
+    return not callable(getattr(c, "trim", None))
 
 
 def has_non_kv_caches(cache: KVCacheType) -> bool:
