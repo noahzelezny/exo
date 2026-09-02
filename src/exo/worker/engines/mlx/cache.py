@@ -568,9 +568,7 @@ class KVPrefixCache:
             trim_cache(prompt_cache, tokens_to_trim, restore_snap)
             # Reset cache offset to match trimmed length
             for c in prompt_cache:
-                if isinstance(c, (ArraysCache, RotatingKVCache)):
-                    continue
-                if isinstance(c, DeepseekV4Cache):
+                if is_non_trimmable_cache_entry(c):
                     continue
                 if hasattr(c, "offset"):
                     c.offset = restore_pos
@@ -684,10 +682,11 @@ def trim_cache(
     snapshot: CacheSnapshot | None = None,
 ) -> None:
     for i, c in enumerate(cache):
-        non_trimmable = isinstance(c, (ArraysCache, RotatingKVCache)) or (
-            isinstance(c, CacheList) and not bool(c.is_trimmable())  # type: ignore[reportUnknownMemberType]
-        )
-        if non_trimmable:
+        # Same predicate as the generate-loop rollback: duck-typed, so
+        # mlx_vlm's cache classes are caught too (a third inline isinstance
+        # copy of this logic crashed the KV-pool restore on GLM-5.3 with
+        # 'ArraysCache' object has no attribute 'trim').
+        if is_non_trimmable_cache_entry(c):
             if snapshot is not None and snapshot.states[i] is not None:
                 restored = copy_snapshot_entry(snapshot.states[i])
                 if restored is not None:
@@ -697,7 +696,7 @@ def trim_cache(
                 if isinstance(c, RotatingKVCache):
                     c.offset = 0
                     c._idx = 0
-            else:
+            elif isinstance(c, CacheList):
                 # CacheList without a snapshot — zero each inner cache's state
                 for inner in c:  # type: ignore[reportUnknownVariableType]
                     if isinstance(inner, (ArraysCache, RotatingKVCache)):
@@ -705,6 +704,12 @@ def trim_cache(
                         if isinstance(inner, RotatingKVCache):
                             inner.offset = 0
                             inner._idx = 0
+            else:
+                # Unknown non-trimmable class (mlx_vlm caches): zero the
+                # array-list state it carries.
+                _cl = getattr(c, "cache", None)
+                if isinstance(_cl, list):
+                    c.cache = [None] * len(_cl)  # type: ignore[attr-defined]
         else:
             c.trim(num_tokens)
 
