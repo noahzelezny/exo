@@ -64,6 +64,13 @@ try:  # qwen4_exp exists only in mlx-lm builds carrying upstream PR #1788
     from mlx_lm.models.qwen4_exp import Qwen4ExpModel as Qwen4ExpInnerModel
 except ImportError:
     Qwen4ExpInnerModel = None  # type: ignore[assignment,misc]
+
+try:  # glm5_next lives in mlx_vlm, which may be absent in text-only installs
+    from mlx_vlm.models.glm5_next.language import (
+        Glm5NextModel as Glm5NextInnerModel,
+    )
+except ImportError:
+    Glm5NextInnerModel = None  # type: ignore[assignment,misc]
 from mlx_lm.models.qwen3_vl import Model as Qwen3VLModel
 from mlx_lm.models.step3p5 import Model as Step35Model
 from mlx_lm.models.step3p5 import Step3p5MLP as Step35MLP
@@ -414,6 +421,30 @@ def pipeline_auto_parallel(
             return _q4_orig_make_cache()[start_layer:end_layer]  # type: ignore[no-any-return]
 
         model.make_cache = _q4_sliced_make_cache  # type: ignore[attr-defined]
+
+    if Glm5NextInnerModel is not None and isinstance(
+        inner_model_instance, Glm5NextInnerModel
+    ):
+        # fa_idx / ssm_idx are computed from the FULL layer list at __init__
+        # and go stale once the shard slices layers: cache[fa_idx] lands on a
+        # recurrent ArraysCache, create_attention_mask sees a bare state
+        # array, falls back to a square chunk mask, and the second prefill
+        # chunk dies on a broadcast_shapes error. make_cache iterates
+        # self.layers so the cache list re-aligns for free; only the two
+        # indices need recomputing on the slice. Rank 0 dodges this by
+        # accident (its slice starts at layer 0).
+        inner_model_instance.ssm_idx = next(
+            (i for i, lyr in enumerate(layers) if getattr(lyr, "is_linear", False)),
+            0,
+        )
+        inner_model_instance.fa_idx = next(
+            (
+                i
+                for i, lyr in enumerate(layers)
+                if not getattr(lyr, "is_linear", True)
+            ),
+            0,
+        )
 
     _set_layers(model, layers)
 
