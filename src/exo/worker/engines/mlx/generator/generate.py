@@ -258,8 +258,22 @@ def pipeline_parallel_prefill(
                 # proportional to prompt length, tens of GB on recurrent
                 # models (measured: +56 GiB on the fat-shard box for a 6.9k
                 # prompt on GLM-5.3, OOMing the pair).
+                pre_eval_active = mx.get_active_memory()
                 mx.eval([c.state for c in _prompt_cache])  # type: ignore
+                post_eval_active = mx.get_active_memory()
                 mx.clear_cache()
+                # Per-chunk memory ledger: pre-eval active = the lazy graph's
+                # footprint when the chunk is forced; post-eval = what the
+                # chunk RETAINED (cache growth + anything the graph pinned).
+                # The gap between post-eval and the chunk peak is the
+                # transient. Cheap (one line/chunk); it's how we find who
+                # owns a prefill swell without a Metal capture.
+                logger.info(
+                    f"[R{rank}] prefill-mem chunk={i + 1}/{n_real} "
+                    f"active_pre={pre_eval_active / 2**30:.1f}G "
+                    f"active_post={post_eval_active / 2**30:.1f}G "
+                    f"peak={mx.get_peak_memory() / 2**30:.1f}G"
+                )
 
                 prompt_progress_callback(processed, total)
 
