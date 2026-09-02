@@ -970,6 +970,18 @@ def set_wired_limit_for_model(model_size: Memory):
         )
     mx.set_wired_limit(max_rec_size.in_bytes)
     logger.info(f"Wired limit set to {max_rec_size}.")
+    # Optional hard ceiling: a runaway allocation under the wired limit
+    # strangles the whole box (both nodes maxed out and froze on a GLM
+    # prefill) instead of failing. With a limit, mlx raises with a stack
+    # trace naming the allocation -- diagnosable, and the OS survives.
+    _mem_gb = os.environ.get("EXO_MLX_MEM_LIMIT_GB")
+    if _mem_gb:
+        try:
+            _limit = int(float(_mem_gb) * (1 << 30))
+            mx.set_memory_limit(_limit)
+            logger.info(f"MLX memory limit set to {_mem_gb} GiB (hard, raises on exceed)")
+        except ValueError:
+            logger.warning(f"Ignoring non-numeric EXO_MLX_MEM_LIMIT_GB={_mem_gb!r}")
 
 
 def mlx_cleanup(
