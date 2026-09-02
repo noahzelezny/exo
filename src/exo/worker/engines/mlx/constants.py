@@ -58,33 +58,40 @@ def kv_bits_for(model_id: str | None) -> int | None:
         return 8
     return KV_BITS
 
+# Per-FAMILY prefill chunk-size overrides (tokens per prefill chunk).
+# Key: lowercase substring matched against the model id. Value: chunk size
+# to use instead of the 4096 upstream default. EXO_PREFILL_STEP_SIZE wins
+# over both. Like `kv_bits_for`, entries are empirical — cite the evidence:
+#
+#   - glm-5.3 : 34 deltanet layers hold per-token recurrent intermediates
+#     (16.8MB/layer state) in the lazy graph across a chunk, so the prefill
+#     transient scales with chunk_size x state, not the KV row.
+#     2026-09-01: OOMed BOTH boxes of a 224GB pair on the 135GB 3.6bpw at
+#     4096 — but that was measured BEFORE the per-chunk mx.eval landed
+#     (the last rank was buffering the whole prompt's graph). With eval
+#     bounding the transient per-chunk, 512 is stale over-caution; 2048 is
+#     the new default, to be confirmed or reverted by the 2026-09-02 soak.
+#
+# NOT in the table (runs the 4096 default):
+#   - Qwen3.5-397B (qwen4_exp) : has ArraysCache entries too (deltanet +
+#     PLE slots), so any "has SSM caches" heuristic catches it — but its
+#     recurrent state is small and it served 4096 chunks for weeks.
+#     2026-09-02: a blanket SSM->512 default made its prefill unusably
+#     slow (8x the chunks, each with a blocking per-chunk eval over the
+#     TCP ring). This table replaced that heuristic.
+PREFILL_STEP_SIZE_BY_FAMILY: dict[str, int] = {
+    "glm-5.3": 2048,
+}
+
+
 def prefill_step_size_for(model_id: str | None) -> int | None:
-    """Per-model prefill chunk-size override (tokens per prefill chunk).
-
-    Returns the chunk size to use instead of the 4096 upstream default, or
-    None to keep the default. EXO_PREFILL_STEP_SIZE still wins over both.
-
-    Like `kv_bits_for`, entries are empirical and must cite the evidence:
-
-    Confirmed-needed small chunks:
-      - GLM-5.3 family : 34 deltanet layers hold per-token recurrent
-        intermediates in the lazy graph across a chunk, so the prefill
-        transient scales with chunk_size x per-layer STATE size
-        (16.8MB/layer), not the KV row. 2026-09-01: OOMed BOTH boxes of a
-        224GB pair on the 135GB 3.6bpw at 4096; 512 caps the transient.
-
-    Confirmed-hurt by small chunks (keep None):
-      - Qwen3.5-397B (qwen4_exp) : also has ArraysCache entries (deltanet
-        + PLE slots), so any "has SSM caches" heuristic catches it — but
-        its recurrent state is small and it served 4096-token chunks for
-        weeks. 2026-09-02: a blanket SSM->512 default made its prefill
-        unusably slow (8x the chunks, each with a blocking per-chunk eval
-        over the TCP ring). This per-model table replaces that heuristic.
-    """
+    """Family-table lookup for the prefill chunk size; None = 4096 default."""
     if not model_id:
         return None
-    if "glm-5.3" in model_id.lower():
-        return 512
+    lowered = model_id.lower()
+    for family, step_size in PREFILL_STEP_SIZE_BY_FAMILY.items():
+        if family in lowered:
+            return step_size
     return None
 
 
