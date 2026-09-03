@@ -186,14 +186,23 @@ class DownloadCoordinator:
     async def _start_download(self, shard: ShardMetadata) -> None:
         model_id = shard.model_card.model_id
 
-        # Check if already downloading, complete, or recently failed
+        # Check if already downloading or complete. A previous DownloadFailed
+        # deliberately does NOT short-circuit: in offline mode "failed" usually
+        # means "placement raced an in-flight copy", and caching it forces a
+        # full node restart once the files finish landing. Falling through
+        # re-resolves from disk, which either succeeds now or re-emits the
+        # same failure -- retrying is always safe here.
         if model_id in self.download_status:
             status = self.download_status[model_id]
-            if isinstance(status, (DownloadOngoing, DownloadCompleted, DownloadFailed)):
+            if isinstance(status, (DownloadOngoing, DownloadCompleted)):
                 logger.debug(
-                    f"Download for {model_id} already in progress, complete, or failed, skipping"
+                    f"Download for {model_id} already in progress or complete, skipping"
                 )
                 return
+            if isinstance(status, DownloadFailed):
+                logger.info(
+                    f"Retrying previously failed model {model_id}: re-resolving local files"
+                )
 
         # Check all model directories for pre-existing complete models
         found_path = await to_thread.run_sync(
