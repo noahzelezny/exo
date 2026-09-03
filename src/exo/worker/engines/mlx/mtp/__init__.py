@@ -8,12 +8,17 @@ sampling at temperature, the committed-alignment scheme) are documented
 and measured in that repo — fix bugs THERE first, then re-vendor, so the
 single-box reference and this copy never diverge silently.
 
-exo-specific glue lives in speculative.py, not in the vendored files.
+exo-specific glue lives in speculative.py and pipeline.py, not in the
+vendored files. loop.py is the ONE exception to "vendored verbatim": it
+carries the stage-1 Coordinator seam (default LocalCoordinator, i.e. a
+no-op) so pipeline and single-node share one loop. Re-vendoring must
+preserve that seam.
 """
 
 from .loop import MTPResponse, load_mtp_head, mtp_stream_generate
+from .pipeline import Coordinator, LocalCoordinator, PipelineCoordinator
 from .registry import FAMILIES, FamilySpec, register, resolve
-from .speculative import maybe_mtp_head, mtp_responses
+from .speculative import MTPPlan, mtp_responses, plan_mtp
 
 __all__ = [
     "MTPResponse",
@@ -23,6 +28,10 @@ __all__ = [
     "FamilySpec",
     "register",
     "resolve",
-    "maybe_mtp_head",
+    "Coordinator",
+    "LocalCoordinator",
+    "PipelineCoordinator",
+    "MTPPlan",
+    "plan_mtp",
     "mtp_responses",
 ]

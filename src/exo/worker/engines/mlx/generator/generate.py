@@ -33,8 +33,6 @@ from exo.shared.types.worker.runner_response import (
     GenerationResponse,
 )
 from exo.worker.engines.mlx.auto_parallel import (
-    PipelineFirstLayer,
-    PipelineLastLayer,
     clear_prefill_sends,
     flush_prefill_sends,
     set_pipeline_prefill,
@@ -58,7 +56,8 @@ from exo.worker.engines.mlx.constants import (
     prefill_step_size_for,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
-from exo.worker.engines.mlx.mtp.speculative import maybe_mtp_head, mtp_responses
+from exo.worker.engines.mlx.mtp.pipeline import is_pipeline_model
+from exo.worker.engines.mlx.mtp.speculative import mtp_responses, plan_mtp
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -157,11 +156,11 @@ class PrefillCancelled(BaseException):
     """Raised when prefill is cancelled via the progress callback."""
 
 
-def _has_pipeline_communication_layer(model: Model):
-    for layer in model.layers:
-        if isinstance(layer, (PipelineFirstLayer, PipelineLastLayer)):
-            return True
-    return False
+def _has_pipeline_communication_layer(model: Model) -> bool:
+    # Single definition, shared with the MTP topology gate: both ask the same
+    # question ("did pipeline_auto_parallel wrap this model?") and two copies
+    # would be free to drift apart.
+    return is_pipeline_model(model)
 
 
 def pipeline_parallel_prefill(
@@ -743,10 +742,8 @@ def mlx_generate(
     # a reused pool prefix cannot provide — so the request bypasses the
     # prefix pool entirely (same call vqlab/serve.py makes). Stage 0.5
     # pairs a head cache with each pooled prefix and lifts this.
-    mtp_head = maybe_mtp_head(
-        model, task.model, group, has_vision=vision is not None
-    )
-    if mtp_head is not None:
+    mtp_plan = plan_mtp(model, task.model, group, has_vision=vision is not None)
+    if mtp_plan is not None:
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
@@ -892,7 +889,7 @@ def mlx_generate(
     logger.info("Starting decode")
     mx_barrier(group)
 
-    if mtp_head is not None:
+    if mtp_plan is not None:
         # The mtp loop owns prefill (head seeding needs every position's
         # hidden state), so it takes the FULL prompt and the fresh cache.
         # SpecResponse is duck-compatible with the GenerationResponse
@@ -901,7 +898,7 @@ def mlx_generate(
             model,
             tokenizer,
             all_prompt_tokens,
-            mtp_head,
+            mtp_plan,
             max_tokens=max_tokens,
             temp=task.temperature if task.temperature is not None else 0.7,
             top_p=task.top_p if task.top_p is not None else 1.0,

@@ -1,10 +1,11 @@
-"""exo-side glue for MTP speculative decoding (stage 0: single node).
+"""exo-side glue for MTP speculative decoding (stages 0 and 1).
 
 Everything here is inert unless the operator sets EXO_MTP=1 — drafting is
 default-OFF while the integration soaks. When enabled, a request drafts
 only if ALL of these hold:
 
-  - the instance is a single node (pipeline verify is stage 1);
+  - the topology is single-node (stage 0) or PIPELINE-sharded (stage 1);
+    tensor sharding is still refused — see `plan_mtp` below;
   - the request carries no images (the vision path patches embed_tokens
     around the trunk forward; untested with the capture wrapper);
   - the model's family is registered and its artifact dir contains the
@@ -12,6 +13,19 @@ only if ALL of these hold:
 
 Anything failing above falls back to the stock decode path silently (one
 log line, no error): the head is a bonus, never a dependency.
+
+Stage 1 in one paragraph. The decode loop is not forked; it runs on every
+pipeline rank, parameterized by a Coordinator (pipeline.py). The head loads
+on the LAST rank only — during prefill that is the one rank whose capture
+point holds the trunk's true final activation, because PipelineLastLayer's
+all_gather is gated off while is_prefill is set — and since the head samples
+the draft, ALL sampling for the request moves to that rank too, or the ranks'
+RNG streams diverge on the first draft. Two small broadcasts per step carry
+the tokens and the accept/reject verdict to the ranks that do not draft.
+
+A consequence worth stating plainly, because it is what makes the gate safe
+to widen: on a non-last rank the head is simply absent (`plan.head is None`),
+so stage 1 costs those nodes no extra memory at all.
 
 Known trade, deliberate for stage 0: an MTP request bypasses the KV
 prefix pool. The head must be seeded with per-position hidden states
@@ -24,6 +38,7 @@ against losing incremental prefill.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from dataclasses import dataclass
@@ -37,6 +52,7 @@ from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
 
 from .loop import load_mtp_head, mtp_stream_generate
+from .pipeline import Coordinator, is_pipeline_model, make_coordinator
 from .registry import resolve
 
 _HEAD_CACHE: dict[str, Any] = {}
@@ -47,19 +63,94 @@ def mtp_enabled() -> bool:
     return os.environ.get("EXO_MTP") == "1"
 
 
-def maybe_mtp_head(
+@dataclass
+class MTPPlan:
+    """How this rank participates in a speculative request.
+
+    `head` is None on every rank but the last: those ranks run the loop for
+    its side effects on their own KV caches and take every token from the
+    control broadcasts. `stage` is for logging only.
+    """
+
+    coord: Coordinator
+    head: Any | None
+    stage: int
+
+    @property
+    def drafts(self) -> bool:
+        return self.head is not None
+
+
+def plan_mtp(
     model: Model,
     model_id: str | None,
     group: mx.distributed.Group | None,
     has_vision: bool,
-) -> Any | None:
-    """The drafting head for this request, or None for the stock path."""
+) -> MTPPlan | None:
+    """The speculative plan for this request, or None for the stock path.
+
+    The topology gate, in one place:
+
+      single node (no group, or world size 1)   -> stage 0
+      multi-node AND pipeline-sharded           -> stage 1
+      multi-node, NOT pipeline-sharded (tensor) -> refused
+
+    The pipeline test asks the MODEL, not the placement metadata
+    (`is_pipeline_model` looks for the wrapper layers `pipeline_auto_parallel`
+    installs). That is deliberate: the property stage 1 depends on is the
+    all_gather inside PipelineLastLayer, and the wrappers ARE that property.
+    Metadata would only tell us how the instance was meant to be built.
+
+    Tensor sharding stays refused because its ranks each hold a slice of every
+    layer, so no rank ever holds a whole final hidden state to draft from; the
+    head would need its own tensor-parallel split. That is not a gate that can
+    be widened by relaxing a condition — it needs a different head.
+    """
     if not mtp_enabled() or not model_id:
         return None
-    if group is not None and group.size() > 1:
-        return None  # stage 1: verify through the pipeline
     if has_vision:
         return None
+
+    multi_node = group is not None and group.size() > 1
+    if multi_node and not is_pipeline_model(model):
+        logger.info(
+            "EXO_MTP=1 but this instance is not pipeline-sharded "
+            "(tensor-parallel drafting is out of scope); decoding "
+            "without drafting"
+        )
+        return None
+
+    coord = make_coordinator(group)
+    stage = 1 if multi_node else 0
+
+    # A non-last pipeline rank never loads a head — it has nothing to draft
+    # from — but it must still take the speculative path, or it would run a
+    # different number of forwards than its peers and the pipeline would
+    # wedge on the first mismatched send.
+    head = _load_head(model, model_id) if coord.is_last else None
+
+    # AGREE on that, do not each decide it. Head loading can fail on one node
+    # and succeed on another — a half-downloaded sidecar, a stale registry
+    # entry against a differently-pinned mlx-lm — and ranks that disagreed
+    # about whether this request is speculative would run different forward
+    # counts and deadlock in recv_like. So the last rank's answer is the
+    # instance's answer. One broadcast per request; the per-step cost is
+    # unaffected.
+    #
+    # Everything checked ABOVE this line is uniform across ranks by
+    # construction (same task, same model) with one operator-owned
+    # exception: EXO_MTP itself must be set identically on every node of the
+    # instance. Setting it on some nodes only is a misconfiguration that
+    # stage 0 shares, and it is a hang, not a wrong answer.
+    verdict = coord.broadcast(mx.array([1 if head is not None else 0], dtype=mx.int32))
+    if int(verdict[0].item()) != 1:
+        return None
+
+    logger.info(f"MTP stage {stage} engaged for {model_id} ({coord!r})")
+    return MTPPlan(coord=coord, head=head, stage=stage)
+
+
+def _load_head(model: Model, model_id: str) -> Any | None:
     if model_id in _HEAD_CACHE:
         return _HEAD_CACHE[model_id]
     if model_id in _HEAD_FAILED:
@@ -92,6 +183,32 @@ def maybe_mtp_head(
         return None
 
 
+def _pipeline_prefill_ctx(model: Model) -> Callable[[], Any]:
+    """Factory for the context the MTP loop wraps its prompt chunks in.
+
+    `is_prefill=True` turns off PipelineLastLayer's per-forward all_gather,
+    which is what makes prompt processing affordable: without it every chunk
+    would gather a [1, chunk, hidden] tensor to every rank. The last rank —
+    the only one that seeds a head — has the true activation either way,
+    because it IS the end of the pipeline.
+
+    Restored in a finally, so a cancelled or failed prefill cannot leave the
+    instance stuck in prefill mode for the next request.
+    """
+
+    @contextlib.contextmanager
+    def ctx():
+        from exo.worker.engines.mlx.auto_parallel import set_pipeline_prefill
+
+        set_pipeline_prefill(model, is_prefill=True)
+        try:
+            yield
+        finally:
+            set_pipeline_prefill(model, is_prefill=False)
+
+    return ctx
+
+
 @dataclass
 class SpecResponse:
     """Duck-compatible with the mlx_lm GenerationResponse fields exo reads."""
@@ -113,7 +230,7 @@ def mtp_responses(
     model: Model,
     tokenizer: TokenizerWrapper,
     prompt_tokens: mx.array,
-    head: Any,
+    plan: MTPPlan,
     *,
     max_tokens: int,
     temp: float,
@@ -147,7 +264,9 @@ def mtp_responses(
         model,
         tokenizer,
         prompt_tokens,
-        head,
+        plan.head,
+        coord=plan.coord,
+        prefill_ctx=_pipeline_prefill_ctx(model) if plan.stage else None,
         max_tokens=max_tokens,
         temp=temp,
         top_p=top_p,
