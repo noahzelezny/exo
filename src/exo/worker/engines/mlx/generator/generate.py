@@ -272,7 +272,8 @@ def pipeline_parallel_prefill(
                     f"[R{rank}] prefill-mem chunk={i + 1}/{n_real} "
                     f"active_pre={pre_eval_active / 2**30:.1f}G "
                     f"active_post={post_eval_active / 2**30:.1f}G "
-                    f"peak={mx.get_peak_memory() / 2**30:.1f}G"
+                    f"peak={mx.get_peak_memory() / 2**30:.1f}G "
+                    f"cache={mx.get_cache_memory() / 2**30:.1f}G"
                 )
 
                 prompt_progress_callback(processed, total)

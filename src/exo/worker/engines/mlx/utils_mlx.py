@@ -983,6 +983,21 @@ def set_wired_limit_for_model(model_size: Memory):
         except ValueError:
             logger.warning(f"Ignoring non-numeric EXO_MLX_MEM_LIMIT_GB={_mem_gb!r}")
 
+    # The buffer-cache ceiling is the one that tames prefill's SYSTEM-level
+    # footprint. The per-chunk ledger's active/peak stayed ~3G above resident
+    # while the OS showed +24G (M3) / +43G (M4) during a 26k GLM prefill
+    # (2026-09-02 night): every intermediate freed inside a chunk parks in
+    # MLX's reuse cache, which returns nothing to the OS until clear_cache at
+    # chunk end -- invisible to get_active_memory, very visible to the box.
+    # A cache limit makes frees beyond it return pages immediately, mid-chunk.
+    _cache_gb = os.environ.get("EXO_MLX_CACHE_LIMIT_GB")
+    if _cache_gb:
+        try:
+            mx.set_cache_limit(int(float(_cache_gb) * (1 << 30)))
+            logger.info(f"MLX cache limit set to {_cache_gb} GiB")
+        except ValueError:
+            logger.warning(f"Ignoring non-numeric EXO_MLX_CACHE_LIMIT_GB={_cache_gb!r}")
+
 
 def mlx_cleanup(
     model: Model | None,
