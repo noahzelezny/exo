@@ -71,6 +71,7 @@ acceptance only — never correctness — so both are safe to add later.
 """
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, List, Optional, Union
@@ -80,6 +81,7 @@ import mlx.core as mx
 from . import registry
 from .capture import capture_input
 from .caches import restore, snapshot
+from .pipeline import Coordinator, LocalCoordinator
 from .sampling import Distribution, make_distribution, rejection_correct
 
 __all__ = ["MTPResponse", "load_mtp_head", "mtp_generate", "mtp_stream_generate"]
@@ -200,6 +202,8 @@ def mtp_stream_generate(
     align: str = "committed",
     prompt_cache=None,
     want_logprobs: bool = False,
+    coord: Optional[Coordinator] = None,
+    prefill_ctx: Optional[Callable[[], Any]] = None,
 ) -> Iterator[MTPResponse]:
     """Stream tokens from `model`, drafting each second token with `head`.
 
@@ -213,9 +217,29 @@ def mtp_stream_generate(
     `prompt_cache` lets a caller (a server) own the trunk cache. It must be
     EMPTY: the head is seeded from this prompt starting at position 0, so a
     cache carrying a reused prefix would shift every rotary position.
+
+    `coord` selects the topology (see pipeline.py). The default,
+    `LocalCoordinator`, is single-node stage 0: `is_last` is True and every
+    broadcast is the identity, so the loop below reduces exactly to what it
+    was before stage 1 existed. A `PipelineCoordinator` makes the same loop
+    run on every pipeline shard: the head, and therefore ALL sampling, moves
+    to the last rank, and two small broadcasts per step carry the tokens and
+    the accept/reject verdict to the ranks that do not draft.
+
+    `prefill_ctx` is a zero-arg context-manager factory wrapped around the
+    prompt chunk loop. Stage 1 uses it to set `is_prefill` on the pipeline
+    layers; single-node leaves it None.
     """
     if align not in ("committed", "legacy"):
         raise ValueError(f"align must be 'committed' or 'legacy', got {align!r}")
+    if coord is None:
+        coord = LocalCoordinator()
+    is_last = coord.is_last
+    if not is_last and align != "committed":
+        # "legacy" drafts before verification off a head cache that only the
+        # last rank owns; there is no coherent non-last behaviour to define,
+        # and the mode exists only for single-node A/B measurement anyway.
+        raise ValueError("align='legacy' is single-node only")
     spec = registry.resolve(model, family)
     dist = make_distribution(temp, top_p, min_p, min_tokens_to_keep, top_k,
                              xtc_probability, xtc_threshold, xtc_special_tokens)
@@ -259,9 +283,20 @@ def mtp_stream_generate(
         # (h_j, embed(x_{j+1})) for EVERY prompt position, not just the last.
         n = ids.shape[1]
         h_chunks = []
-        for i in range(0, n - 1, prefill_step_size):
-            chunk = ids[:, i:min(i + prefill_step_size, n - 1)]
-            if chunk.shape[1]:
+        # Only the last rank captures a MEANINGFUL hidden state during
+        # prefill: PipelineLastLayer's cross-rank all_gather is gated off
+        # while is_prefill is set, so an intermediate rank's capture point
+        # sees its own shard's output, not the trunk's final activation.
+        # Seeding a head from that would not fail loudly — it would just
+        # draft noise — so the seeding is confined to the rank that owns
+        # the real activation, and stays there for the whole request.
+        seed_head = align == "committed" and is_last
+        ctx = prefill_ctx() if prefill_ctx is not None else contextlib.nullcontext()
+        with ctx:
+            for i in range(0, n - 1, prefill_step_size):
+                chunk = ids[:, i:min(i + prefill_step_size, n - 1)]
+                if not chunk.shape[1]:
+                    continue
                 model(chunk, cache=cache)
                 # Evaluate the CACHE (and the captured hidden state, which the
                 # head is seeded from) -- never the logits. MLX is lazy, so
@@ -273,20 +308,31 @@ def mtp_stream_generate(
                 # reason. Only the final single-token forward below needs
                 # logits.
                 want = [c.state for c in cache if hasattr(c, "state")]
-                if align == "committed":
+                if seed_head:
                     h = get_h()
                     h_chunks.append(h)
                     want.append(h)
                 mx.eval(want)
                 mx.clear_cache()
+        # OUTSIDE prefill_ctx on purpose: this forward's logits are the ones
+        # the first token is sampled from, so every rank needs the gathered,
+        # real logits — the same call _echo_score makes for the same reason.
         logits = model(ids[:, max(n - 1, 0):], cache=cache)
-        h_chunks.append(get_h())
-        h_last = h_chunks[-1][:, -1:]
         row_t1 = logits[:, -1]
-        t1, _ = pick(row_t1)
-        mx.eval(t1, h_last)
+        h_last = None
+        if is_last:
+            h_chunks.append(get_h())
+            h_last = h_chunks[-1][:, -1:]
+            t1, _ = pick(row_t1)
+            mx.eval(t1, h_last)
+        else:
+            # Placeholder. The real t1 arrives in this step's control
+            # broadcast; a non-last rank never samples, because the last
+            # rank's draft sampling has already advanced its RNG stream
+            # past everyone else's.
+            t1 = mx.zeros((1,), dtype=mx.int32)
 
-        if align == "committed":
+        if seed_head:
             # Seed positions 0..P-2 so the head enters decoding with the same
             # history the trunk has, and with cache.offset == P-1. Position
             # P-1 is not seeded: its input needs x_P, the first sampled
@@ -307,40 +353,85 @@ def mtp_stream_generate(
 
         while finish is None:
             steps += 1
-            if align == "legacy":
-                # Drafted BEFORE verification off a cache that advances one
-                # position per step, so it must be rolled back on rejection.
-                dsnap = snapshot([dcache], copy=copy_caches)
-                draft_row = head.draft_logits(h_last, t1[None], dcache)[:, -1]
-            if dist is None:
-                d2 = mx.argmax(draft_row, axis=-1)
-                q = None
+            if is_last:
+                if align == "legacy":
+                    # Drafted BEFORE verification off a cache that advances
+                    # one position per step, so it must be rolled back on
+                    # rejection.
+                    dsnap = snapshot([dcache], copy=copy_caches)
+                    draft_row = head.draft_logits(h_last, t1[None], dcache)[:, -1]
+                if dist is None:
+                    d2 = mx.argmax(draft_row, axis=-1)
+                    q = None
+                else:
+                    for proc in processors:
+                        draft_row = proc(mx.array(emitted), draft_row)
+                    q = dist(draft_row)
+                    d2 = q.sample()
+                mx.eval(d2)
             else:
-                for proc in processors:
-                    draft_row = proc(mx.array(emitted), draft_row)
-                q = dist(draft_row)
-                d2 = q.sample()
-            mx.eval(d2)
+                q = None
+                d2 = mx.zeros((1,), dtype=mx.int32)
+
+            # --- control broadcast B1: [t1, d2] -------------------------
+            # Both tokens, together, because rank 0 has to EMBED them: the
+            # verify forward below is `model([t1, d2])` on every rank, and a
+            # rank that guessed either id would silently compute a different
+            # pipeline than the one whose logits decide the verdict.
+            # t1 rides here rather than in the previous step's B2 because it
+            # is only known after that step's rollback-and-replay.
+            pair_in = coord.broadcast(
+                mx.concatenate([t1, d2]).astype(mx.int32)
+            )
+            t1, d2 = pair_in[0:1], pair_in[1:2]
 
             csnap = snapshot(cache, copy=copy_caches)
+            # The verify forward: one T-wide (T=2) pass through the existing
+            # distributed pipeline. Identical in shape to a prefill chunk, so
+            # it needs no new collective — the hidden state hops shard to
+            # shard on the same send/recv the stock path uses, and
+            # PipelineLastLayer's decode-time all_gather leaves every rank
+            # holding the same lg2.
             lg2 = model(mx.concatenate([t1, d2])[None], cache=cache)
 
-            if dist is None:
-                true_t2 = mx.argmax(lg2[:, 0], axis=-1)
-                mx.eval(true_t2)
-                ok = bool((true_t2 == d2).item())
-                t2 = d2 if ok else true_t2
+            if is_last:
+                if dist is None:
+                    true_t2 = mx.argmax(lg2[:, 0], axis=-1)
+                    mx.eval(true_t2)
+                    ok = bool((true_t2 == d2).item())
+                    t2 = d2 if ok else true_t2
+                else:
+                    p = dist(lg2[:, 0])
+                    acc, t2 = rejection_correct(p.probs, q.probs, d2)
+                    mx.eval(acc, t2)
+                    ok = bool(acc.item())
+                verdict = mx.concatenate(
+                    [mx.array([1 if ok else 0]), t2.astype(mx.int32)]
+                ).astype(mx.int32)
             else:
-                p = dist(lg2[:, 0])
-                acc, t2 = rejection_correct(p.probs, q.probs, d2)
-                mx.eval(acc, t2)
-                ok = bool(acc.item())
+                verdict = mx.zeros((2,), dtype=mx.int32)
+
+            # --- control broadcast B2: [ok, t2] -------------------------
+            # THE rollback protocol. Every rank trims iff this flag says so,
+            # so the trim is lockstep by construction rather than by each
+            # rank re-deriving the verdict: at temperature the verdict is a
+            # coin flip inside rejection_correct, and only the last rank
+            # tosses it. Unconditional and in fixed order relative to B1 —
+            # a verdict-dependent collective count would deadlock the first
+            # time two ranks disagreed, which is the exact bug this exists
+            # to prevent.
+            verdict = coord.broadcast(verdict)
+            ok = bool(verdict[0].item() == 1)
+            t2 = verdict[1:2]
 
             if ok:
                 accepted += 1
             else:
                 # Roll back to before the drafted pair and replay the tokens
                 # actually emitted, so the caches match the emitted stream.
+                # `restore` trims each cache by ITS OWN measured offset
+                # delta, which is what makes one shared verdict correct for
+                # shards holding different numbers of layers.
                 restore(cache, csnap)
                 if align == "legacy":
                     restore([dcache], dsnap)
@@ -380,9 +471,16 @@ def mtp_stream_generate(
             # `get_h()` is the hidden state of the forward that actually
             # committed — the replay on the rejection path, not the discarded
             # speculative one — so it is (h_i, h_{i+1}) for the emitted pair.
+            row_t1 = lg2[:, 1]
+            if not is_last:
+                # Nothing to draft and nothing to sample; the next step's B1
+                # supplies the real t1. Left as a placeholder of the right
+                # shape and dtype so the broadcast stays symmetric.
+                t1 = mx.zeros((1,), dtype=mx.int32)
+                continue
+
             h_pair = get_h()
             h_last = h_pair[:, -1:]
-            row_t1 = lg2[:, 1]
             t_next, _ = pick(row_t1)
             mx.eval(t_next, h_pair)
 
