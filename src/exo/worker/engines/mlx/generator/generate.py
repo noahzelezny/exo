@@ -807,7 +807,7 @@ def mlx_generate(
         else contextlib.nullcontext()
     )
     use_remote = (
-        mtp_head is None
+        mtp_plan is None
         and len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
         and task.prefill_endpoint is not None
     )
@@ -832,7 +832,7 @@ def mlx_generate(
                 logger.opt(exception=True).warning(
                     "Remote prefill failed, falling back to local prefill"
                 )
-        if not remote_prefilled and mtp_head is None:
+        if not remote_prefilled and mtp_plan is None:
             prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
                 model,
                 tokenizer,
