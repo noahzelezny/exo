@@ -134,6 +134,19 @@ def plan_mtp(
     # from — but it must still take the speculative path, or it would run a
     # different number of forwards than its peers and the pipeline would
     # wedge on the first mismatched send.
+    # The absorbed-MLA shim must be live on EVERY rank, not only the one
+    # holding the head: the verify forward model([t1, d2]) runs on all
+    # ranks, and an unshimmed rank pays the unabsorbed latent-cache
+    # expansion on ITS shard of layers — a tax that grows with context.
+    # Measured 2026-09-03, first live 2-node run: last-rank-only shim gave
+    # 6.9 tok/s at 300 tokens (vs 19.5 stock) with acceptance 0.873; the
+    # head was never the problem. Cost-only, output-identical (one bf16
+    # ULP), so installing it on a rank that ends up not drafting is safe.
+    try:
+        _maybe_install_glm5_shim(resolve(model))
+    except KeyError:
+        pass  # unregistered family: the gate below refuses anyway
+
     head = _load_head(model, model_id) if coord.is_last else None
 
     # AGREE on that, do not each decide it. Head loading can fail on one node
