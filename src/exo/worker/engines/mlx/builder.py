@@ -33,6 +33,25 @@ from .utils_mlx import (
 from .vision import VisionProcessor
 
 
+def _mtp_would_engage(model: Model, model_id: ModelId) -> bool:
+    """True when MTP drafting would actually activate for this model:
+    EXO_MTP set, the family registered, and the sidecar on disk. Used to
+    auto-select the sequential engine (the only path with an MTP loop) so
+    the operator sets ONE knob, not two. Deliberately mirrors plan_mtp's
+    per-request gates minus the topology ones — topology cannot flip
+    between engine choice and the first request on this runner."""
+    if os.environ.get("EXO_MTP") != "1":
+        return False
+    try:
+        from exo.download.download_utils import build_model_path
+        from exo.worker.engines.mlx.mtp.registry import resolve
+
+        spec = resolve(model)
+        return (build_model_path(model_id) / spec.sidecar_name).exists()
+    except Exception:
+        return False
+
+
 def _has_unbatchable_cache(model: Model) -> bool:
     """mlx_lm's batch engine rejects some cache types ("ChunkedKVCache does not
     yet support batching with history" — llama4 being the current case). Probe
@@ -110,10 +129,13 @@ class MlxBuilder(Builder):
 
         device_rank = 0 if self.group is None else self.group.rank()
         unbatchable = _has_unbatchable_cache(self.inference_model)
-        if os.environ.get("EXO_NO_BATCH") or unbatchable:
+        will_draft = _mtp_would_engage(self.inference_model, self.model_id)
+        if os.environ.get("EXO_NO_BATCH") or unbatchable or will_draft:
             reason = (
                 "chunked KV cache; batch engine disabled"
                 if unbatchable
+                else "EXO_MTP drafting engages; batch engine has no MTP path"
+                if will_draft
                 else "batching disabled"
             )
             logger.info(f"using SequentialGenerator ({reason})")
