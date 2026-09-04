@@ -380,14 +380,29 @@ def _sidecar_dir(monkeypatch, tmp_path):
     return speculative, model
 
 
-def test_load_head_resolves_glm_and_installs_the_shim(monkeypatch, tmp_path):
+def test_load_head_resolves_glm(monkeypatch, tmp_path):
+    spec_mod, model = _sidecar_dir(monkeypatch, tmp_path)
+    head = spec_mod._load_head(model, "TheDrainFlorist/GLM-5.3-Flash-VQ-2.7bpw")
+    assert isinstance(head, MTPHeadGlm5)
+
+
+def test_plan_level_shim_install_covers_every_rank(monkeypatch, tmp_path):
+    # The shim moved from _load_head (last rank only) to plan_mtp (every
+    # rank): the verify forward runs on all ranks, and an unshimmed peer
+    # rank pays the unabsorbed latent-cache expansion on its shard —
+    # measured live 2026-09-03 at 6.9 tok/s vs 19.5 stock. _load_head
+    # itself must NOT install (once per plan, not twice on the last rank).
+    from exo.worker.engines.mlx.mtp.registry import resolve
+
     spec_mod, model = _sidecar_dir(monkeypatch, tmp_path)
     installs: list[int] = []
     monkeypatch.setattr(glm5_shim, "install", lambda *a, **k: installs.append(1) or True)
 
-    head = spec_mod._load_head(model, "TheDrainFlorist/GLM-5.3-Flash-VQ-2.7bpw")
-    assert isinstance(head, MTPHeadGlm5)
-    assert installs == [1], "the absorbed-MLA shim was not installed for glm5_next"
+    spec_mod._load_head(model, "TheDrainFlorist/GLM-5.3-Flash-VQ-2.7bpw")
+    assert installs == [], "_load_head must no longer install the shim"
+
+    assert spec_mod._maybe_install_glm5_shim(resolve(model)) is True
+    assert installs == [1], "plan-level install did not reach glm5_shim.install"
 
 
 def test_the_shim_is_not_installed_for_other_families(monkeypatch):

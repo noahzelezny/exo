@@ -219,7 +219,7 @@ def _load_head(model: Model, model_id: str) -> Any | None:
             )
             _HEAD_FAILED.add(model_id)
             return None
-        _maybe_install_glm5_shim(spec)
+        # shim install happens in plan_mtp, on every rank, before this
         before = mx.get_active_memory()
         head, spec = load_mtp_head(model, sidecar=sidecar)
         logger.info(
