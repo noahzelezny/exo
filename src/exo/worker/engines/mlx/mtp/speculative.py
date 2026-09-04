@@ -109,6 +109,13 @@ def plan_mtp(
     if not mtp_enabled() or not model_id:
         return None
     if has_vision:
+        # A vision REQUEST, not a vision-capable MODEL. The caller passes
+        # `vision is not None`, and `prepare_vision` returns None whenever the
+        # request carries no images (generator/generate.py) — so a text-only
+        # request against an image-text-to-text artifact (every GLM-5.3-Flash-VQ
+        # build is one) still drafts. That distinction is load-bearing for
+        # glm5_next: gating on the model's capability instead would refuse
+        # every GLM request, including the ones the head is for.
         return None
 
     multi_node = group is not None and group.size() > 1
@@ -150,6 +157,40 @@ def plan_mtp(
     return MTPPlan(coord=coord, head=head, stage=stage)
 
 
+#: families whose runtime needs the absorbed-MLA shim before drafting.
+_GLM5_FAMILIES = ("glm5_next", "glm5_next_text")
+
+
+def _maybe_install_glm5_shim(spec: Any) -> bool:
+    """Widen glm5_next's absorbed-MLA route to L <= 8, for MTP verify only.
+
+    Upstream `Glm5NextSparseAttention` takes the absorbed route at L == 1
+    only; the MTP verify forward is L == 2 and falls off it, onto a
+    per-layer latent-cache expansion VQLab measured at up to 23-40x the
+    absorbed cost at long Kv. Without this, drafting on glm5_next is a net
+    LOSS, so the port would be worse than useless. The two routes are
+    algebraically identical (VQLab: equal to one bf16 ULP), so this changes
+    cost, not output.
+
+    Scope: called from `_load_head` only, i.e. only when EXO_MTP=1 AND the
+    resolved family is glm5_next AND a sidecar exists. With EXO_MTP unset
+    this function is never reached and the stock path is untouched. The
+    patch is process-wide once installed (it is a class monkeypatch), which
+    is why it is deliberately not installed at import time.
+    """
+    if spec.name not in _GLM5_FAMILIES:
+        return False
+    from . import glm5_shim
+
+    installed = glm5_shim.install()
+    if installed:
+        logger.info(
+            f"glm5_next absorbed-MLA shim installed (L <= "
+            f"{glm5_shim.ABSORB_MAX_L}) for MTP verification"
+        )
+    return installed
+
+
 def _load_head(model: Model, model_id: str) -> Any | None:
     if model_id in _HEAD_CACHE:
         return _HEAD_CACHE[model_id]
@@ -165,6 +206,7 @@ def _load_head(model: Model, model_id: str) -> Any | None:
             )
             _HEAD_FAILED.add(model_id)
             return None
+        _maybe_install_glm5_shim(spec)
         before = mx.get_active_memory()
         head, spec = load_mtp_head(model, sidecar=sidecar)
         logger.info(

@@ -8,6 +8,13 @@ sampling at temperature, the committed-alignment scheme) are documented
 and measured in that repo — fix bugs THERE first, then re-vendor, so the
 single-box reference and this copy never diverge silently.
 
+glm5_shim.py and heads/glm5.py are the same arrangement, vendored from
+vqlab/glm5_shim.py @ 31b11b7 and vqlab/mtp_head_glm5.py @ 9eff3f0
+(2026-09-02); each carries its own provenance header. The shim is a
+monkeypatch of mlx_vlm's `Glm5NextSparseAttention.__call__`, installed
+ONLY from speculative.py's `_load_head` — i.e. only when a glm5_next MTP
+head actually loads.
+
 exo-specific glue lives in speculative.py and pipeline.py, not in the
 vendored files. loop.py is the ONE exception to "vendored verbatim": it
 carries the stage-1 Coordinator seam (default LocalCoordinator, i.e. a

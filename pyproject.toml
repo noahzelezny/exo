@@ -251,6 +251,10 @@ extend-select = ["I", "N", "B", "A", "PIE", "SIM"]
 # reference and this copy never diverge; style rules stay upstream's.
 "src/exo/worker/engines/mlx/mtp/{capture,caches,sampling,loop,registry}.py" = ["I", "N", "B", "E741", "F401"]
 "src/exo/worker/engines/mlx/mtp/heads/*.py" = ["I", "N", "B", "E741", "F401"]
+# glm5_shim.py's patched __call__ is upstream mlx_vlm's body verbatim apart
+# from the two route tests; its B/L/Kv names must stay upstream's, or a
+# future diff against mlx_vlm stops being readable.
+"src/exo/worker/engines/mlx/mtp/glm5_shim.py" = ["I", "N", "B", "E741", "F401", "SIM"]
 
 [tool.pytest.ini_options]
 pythonpath = "."

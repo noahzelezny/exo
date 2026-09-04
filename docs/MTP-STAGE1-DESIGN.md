@@ -268,8 +268,8 @@ one documented exception to verbatim vendoring, called out in
 
 ## Tests
 
-`src/exo/worker/tests/unittests/test_mlx/test_mtp_pipeline.py` (22 tests, no
-cluster, no model download):
+`src/exo/worker/tests/unittests/test_mlx/test_mtp_pipeline.py` (22 tests) and
+`test_mtp_glm5.py` (21 tests), no cluster, no model download:
 
 - **Fake 2-shard pipeline** — two `ToyModel` shards with **different cache
   counts** (3 and 5, so a fixed-count trim cannot pass), running the *real*
@@ -294,7 +294,16 @@ cluster, no model download):
 - **Coordinator units** — last-rank identification, single-rank collapse, and
   refusal of >1-D payloads (a hidden state must never ride the control path).
 
-Full local suite: **526 passed, 3 skipped**. `ruff` clean.
+GLM-specific (`test_mtp_glm5.py`): the registry resolves `glm5_next` /
+`glm5_next_text` (the exact `KeyError` the live run hit); `arch_module` and the
+loop's capture point both walk a VLM wrapper that has no `.model`; the head
+round-trips through a real sidecar against a stand-in arch module; the shim
+selects the absorbed route at L <= 8 and the upstream route above it; the shim
+is installed only for glm5 families and only when a head loads; and one test
+drives the **real `mlx_generate`** with a stubbed trunk + real head, because
+stage 1's tests never exercised that path and the gap shipped a crash.
+
+Full local suite: **547 passed, 3 skipped** (2026-09-03). `ruff` clean.
 
 ---
 
@@ -336,15 +345,29 @@ Not run here, by instruction. The orchestrator should check:
 3. **`EXO_MTP` must be uniform across nodes.** Non-uniform is a hang. Worth a
    startup-time agreement check if stage 1 ever moves toward default-on.
 4. **Family coverage — check which "Flash" before booking the smoke.**
-   Registered families are exactly `qwen4_exp`, `qwen3_5`, `qwen3_5_moe`.
-   - **Qwen3.8-Flash-Next** resolves to `qwen3_5` / `qwen3_5_moe` — registered,
-     and the right choice for the first smoke.
-   - **GLM-5.3-Flash** resolves to `glm5_next`, which is **not registered**
-     (GLM-5.3 ships an MTP layer, but there is no head module for it here).
-     That instance will take the refusal path and decode normally — a correct
-     outcome, but it smoke-tests nothing.
+   Registered families are `qwen4_exp`, `qwen3_5`, `qwen3_5_moe`, and (since
+   2026-09-03) `glm5_next` / `glm5_next_text`.
+   - **Qwen3.8-Flash-Next** resolves to `qwen3_5` / `qwen3_5_moe`.
+   - **GLM-5.3-Flash** resolves to `glm5_next`, vendored from VQLab
+     (`mtp/heads/glm5.py`, `mtp/glm5_shim.py`). VQLab measured 0.8516
+     acceptance on ONE BOX; **nothing about GLM drafting has been measured in
+     exo or on a cluster**, so its smoke run is a first measurement, not a
+     confirmation.
    Either way the run also needs `mtp-head-q6.safetensors` present in the
    artifact dir, or the gate refuses at the sidecar check.
+
+   Two GLM-specific notes:
+   - **The absorbed-MLA shim is load-bearing, not an optimization.** Upstream
+     `Glm5NextSparseAttention` takes the absorbed route only at `L == 1`; the
+     `L == 2` verify forward falls onto a per-layer latent-cache expansion
+     VQLab measured at up to ~40x the absorbed cost at long `Kv`. Without the
+     shim, drafting on GLM is a net loss. exo installs it from `_load_head`,
+     so it is inert unless `EXO_MTP=1` and a glm5_next head actually loads.
+     It is a process-wide class monkeypatch once installed.
+   - **A text-only request on a vision-capable model still drafts.** The gate
+     refuses a vision *request* (`vision is not None`), not a vision-capable
+     *model*; every GLM-5.3-Flash-VQ artifact is image-text-to-text, so gating
+     on capability would refuse every request the head exists for.
 5. **Non-last ranks allocate an unused draft cache.** `spec.make_draft_cache`
    still runs on every rank. It is empty and cheap, but it is dead state.
 6. **Thread-based tests are a model of the cluster, not the cluster.** They

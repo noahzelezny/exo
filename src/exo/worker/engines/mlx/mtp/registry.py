@@ -27,11 +27,12 @@ architectures genuinely differ:
 Families that ship an MTP head upstream but are NOT registered here, because
 nothing in this repo can test them today:
 
-  glm5_next   GLM-5.3 ships an MTP layer (layer 45, its own full expert
-              stack — see families.py). mlx-lm has no glm5_next class yet, so
-              there is no arch module to build a head against.
   deepseek_v3 DeepSeek's MTP module is a different shape again (its own
               embed/norm/head rather than a shared lm_head).
+
+(glm5_next graduated 2026-09-03, vendored from VQLab: the old blocker was
+"mlx-lm has no glm5_next class", but the trunk runs under mlx_vlm's class —
+which exo also uses — so the head binds to THAT arch module.)
 
 Registering either means writing its head module and running
 `caches.check_snapshot_semantics` plus the acceptance probe first. A table
@@ -58,8 +59,20 @@ class FamilySpec:
 
     def arch_module(self, model):
         """The module the trunk's classes were defined in. Artifacts ship a
-        `model.py` that subclasses the registry arch, so walk to the core."""
-        return importlib.import_module(type(model.model).__module__)
+        `model.py` that subclasses the registry arch, so walk to the core.
+
+        Vision-capable artifacts (the 397B's `custom_model.Model`, the GLM
+        VLM wrapper) have no `.model` of their own -- the core hangs off
+        `.language_model` -- so walk that first when it is there. The bound
+        text model is what every head class binds to anyway."""
+        text = getattr(model, "language_model", model)
+        core = getattr(text, "model", None)
+        if core is None:
+            raise RuntimeError(
+                f"family {self.name}: {type(model).__name__} exposes neither "
+                f"`.model` nor `.language_model.model`; cannot resolve the "
+                f"architecture module")
+        return importlib.import_module(type(core).__module__)
 
     def make_draft_cache(self, arch):
         try:
@@ -111,7 +124,8 @@ def resolve(model, family: str | None = None) -> FamilySpec:
     raise KeyError(
         f"no MTP family registered for model_type {mt!r}; registered: "
         f"{sorted(FAMILIES)}. Adding one is a FamilySpec in "
-        f"vqlab/mtp/registry.py plus a head module — read that docstring.")
+        f"exo/worker/engines/mlx/mtp/registry.py plus a head module — read "
+        f"that docstring.")
 
 
 # ------------------------------------------------------------------ builtins
@@ -151,6 +165,38 @@ for _qwen35_name in ("qwen3_5", "qwen3_5_moe"):
     register(FamilySpec(
         name=_qwen35_name,
         head="exo.worker.engines.mlx.mtp.heads.qwen35:MTPHeadQwen35",
+        capture="norm",
+        draft_cache="KVCache",
+        sidecar_name="mtp-head-q6.safetensors",
+        cache_semantics="reassign",
+    ))
+
+
+# GLM-5.3 (glm5_next, via mlx_vlm's classes — the head binds the
+# LanguageModel, not the VLM wrapper; `arch_module` above does that walk).
+# The head is upstream `layers.45`: a plain-residual DeepSeek-style block
+# (NoPE MLA + DSA indexer + 288-expert MoE + its own shared_head.norm) —
+# see heads/glm5.py for why it is NOT the trunk's hc DecoderLayer.
+# capture="norm": the trunk's final-norm INPUT is the mean-collapsed
+# (B, S, D) hidden, which is what hnorm/eh_proj consume.
+# draft_cache is vestigial here — the head class provides
+# make_draft_cache() (CacheList(main-KV, indexer-KV)) and loop.py prefers
+# that; the attribute name is kept non-empty so the spec stays valid.
+# cache_semantics="reassign": VQLab's check_snapshot_semantics returned
+# True against the loaded 2.7bpw trunk (M4, 2026-09-02).
+#
+# Registered under both names: the VLM wrapper's config says glm5_next,
+# the TextConfig on the bound LanguageModel says glm5_next_text.
+#
+# NUMBERS MEASURED IN VQLAB ON ONE BOX, NOT IN EXO AND NOT ON A CLUSTER:
+# acceptance 0.8516 pooled (12 prompts x 128 tokens, q6 head, 2.7bpw
+# trunk, M4, 2026-09-02) and 1.05x end-to-end WITHOUT the absorbed-MLA
+# shim. exo installs that shim (glm5_shim.py) whenever this family's head
+# loads; its effect on exo's end-to-end rate is UNMEASURED.
+for _glm_name in ("glm5_next", "glm5_next_text"):
+    register(FamilySpec(
+        name=_glm_name,
+        head="exo.worker.engines.mlx.mtp.heads.glm5:MTPHeadGlm5",
         capture="norm",
         draft_cache="KVCache",
         sidecar_name="mtp-head-q6.safetensors",

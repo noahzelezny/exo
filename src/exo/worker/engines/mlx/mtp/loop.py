@@ -261,7 +261,14 @@ def mtp_stream_generate(
         d = dist(row)
         return d.sample(), d
 
-    with capture_input(model.model, spec.capture) as get_h:
+    # Vision-capable artifacts (the 397B's custom_model.Model, the GLM VLM
+    # wrapper) carry no `.model`; the core the capture path is relative to
+    # hangs off `.language_model`. Same walk as spec.arch_module.
+    core = getattr(getattr(model, "language_model", model), "model", None)
+    if core is None:
+        raise RuntimeError(f"{type(model).__name__} exposes neither `.model` "
+                           f"nor `.language_model.model`")
+    with capture_input(core, spec.capture) as get_h:
         cache = model.make_cache() if prompt_cache is None else prompt_cache
         # A caller-supplied cache that already holds a prefix would put the
         # head's positions back exactly where the alignment fix took them
@@ -276,7 +283,14 @@ def mtp_stream_generate(
                 f"prompt_cache already holds {used} positions; the MTP head "
                 f"cannot be aligned to a reused trunk cache yet. Pass a fresh "
                 f"cache, or use align='legacy' (which is misaligned anyway).")
-        dcache = spec.make_draft_cache(arch)
+        # A head that knows its own cache shape builds it (glm5_next needs
+        # a CacheList(main-KV, indexer-KV), which a single registry attr
+        # name cannot express); otherwise the registry's factory applies.
+        # `head` is None on every non-last pipeline rank, which is why the
+        # registry factory has to stay as the fallback.
+        dcache = (head.make_draft_cache()
+                  if head is not None and hasattr(head, "make_draft_cache")
+                  else spec.make_draft_cache(arch))
 
         # prefill. The per-chunk hidden states are kept when the head is
         # being seeded, because the head's input at position j is
