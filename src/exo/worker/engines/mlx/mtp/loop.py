@@ -470,8 +470,13 @@ def mtp_stream_generate(
                 if want_logprobs:
                     r32 = row.astype(mx.float32)
                     lp = (r32 - mx.logsumexp(r32, axis=-1, keepdims=True))[0]
+                # A stop token ends the turn; its surface text (<|user|>,
+                # <|endoftext|>, ...) must never reach the stream. The
+                # stock path strips it; this loop leaked it (seen live
+                # 2026-09-04: GLM replies rendered a trailing <|user|>).
+                text = "" if finish == "stop" else detok.add(token)
                 yield MTPResponse(
-                    text=detok.add(token), token=token, from_draft=from_draft,
+                    text=text, token=token, from_draft=from_draft,
                     finish_reason=finish, steps=steps, accepted=accepted,
                     acceptance=accepted / steps, generation_tokens=len(emitted),
                     generation_tps=len(emitted) / elapsed if elapsed else 0.0,

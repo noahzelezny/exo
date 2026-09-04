@@ -409,6 +409,32 @@ def test_two_shard_stops_together_on_eos():
     assert eos not in out["r0"][:-1], "generation continued past EOS"
 
 
+def test_stop_token_text_never_reaches_the_stream():
+    """The stop token ends the turn; its SURFACE TEXT must not be emitted.
+    Live 2026-09-04: GLM replies rendered a trailing <|user|> because the
+    loop yielded detok.add(token) for the eos token before breaking."""
+    prompt = mx.array([[3, 4, 5, 6, 7]])
+    first = _true_next(7)
+    eos = _true_next(_true_next(first))
+
+    class EosTokenizer(ToyTokenizer):
+        eos_token_ids = {eos}
+
+    model = ToyModel(8)
+    texts, finishes = [], []
+    for r in mtp_stream_generate(
+        model, EosTokenizer(), prompt, ToyHead([True] * 64), family=FAMILY,
+        max_tokens=64, temp=0.0, prompt_cache=model.make_cache(),
+    ):
+        texts.append(r.text)
+        finishes.append(r.finish_reason)
+    assert finishes[-1] == "stop"
+    eos_surface = EosTokenizer().decode([eos])
+    assert eos_surface not in "".join(texts), (
+        "stop-token text leaked into the stream")
+    assert texts[-1] == "", "the final (stop) response must carry no text"
+
+
 def _single_node_run(accepts: list[bool], max_tokens: int, prompt_len: int = 5):
     """Stage 0: the same loop, default coordinator, one rank."""
     prompt = mx.array([[3 + i for i in range(prompt_len)]])
