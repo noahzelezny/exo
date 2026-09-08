@@ -1,3 +1,5 @@
+import os
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator
 from functools import partial
@@ -6,6 +8,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 from mlx.nn.layers.distributed import (
     shard_inplace,
     shard_linear,
@@ -132,6 +135,15 @@ class CustomMlxLayer(nn.Module):
                 return getattr(original_layer, name)
 
 
+# Temporary dtype instrument (2026-09-07). See PipelineFirstLayer.__call__.
+_PROBED = False
+
+
+def _probe(msg: str) -> None:
+    global _PROBED
+    print(f"[dtype-probe] {msg}", file=sys.stderr, flush=True)
+
+
 class PipelineFirstLayer(CustomMlxLayer):
     def __init__(
         self,
@@ -144,13 +156,58 @@ class PipelineFirstLayer(CustomMlxLayer):
         self.group = group
         self.is_prefill: bool = False
 
+    def _recv_dtype(self) -> "mx.Dtype | None":
+        """The dtype this rank's OWN weights are in.
+
+        `recv_like` takes shape AND dtype from the local template, and on a
+        non-zero rank that template is whatever this rank's (weightless)
+        embed_tokens produced — float32, because an unloaded nn.Embedding
+        initialises float32. Rank 0 sends bf16 activations, so the receive
+        buffer disagreed with the sender's element width, and every layer on
+        this shard then ran in float32.
+
+        Measured 2026-09-07 on the 397B: rank 0 sent bfloat16 (1,19,4096),
+        rank 1's pre-recv template was float32. That model has head_dim 256,
+        where float32 attention wants 53760 B of threadgroup memory against a
+        32768 B cap, so MLX could not LOAD the kernel and the runner aborted
+        -- which is how a long-standing dtype bug finally surfaced. Families
+        with a smaller head_dim stayed under the cap and merely ran the last
+        shard in float32.
+
+        Take the dtype from a real parameter of this rank's first layer:
+        norms are plain floats and quantized layers keep bf16 scales, so the
+        first non-float32 float parameter is the trunk's dtype.
+        """
+        dt = self.__dict__.get("_cached_recv_dtype", False)
+        if dt is not False:
+            return cast("mx.Dtype | None", dt)
+        found = None
+        try:
+            for _, p in tree_flatten(self.original_layer.parameters()):
+                if isinstance(p, mx.array) and p.dtype in (mx.bfloat16, mx.float16):
+                    found = p.dtype
+                    break
+        except Exception:  # never let a probe break inference
+            found = None
+        self.__dict__["_cached_recv_dtype"] = found
+        return found
+
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
         if self.r != 0:
             # We want to avoid GPU timeout errors by evalling the distributed operation
             # so that it stays on CPU, which does not have a timeout.
             mx.eval(x)
+            if os.environ.get("EXO_DTYPE_PROBE") == "1" and not _PROBED:
+                _probe(f"PipelineFirstLayer r={self.r} pre-recv x.dtype={x.dtype} shape={x.shape}")
+            dt = self._recv_dtype()
+            if dt is not None and x.dtype != dt:
+                # Only shape/dtype are read off the template; the values are
+                # overwritten by the receive, so this cast is free of meaning.
+                x = x.astype(dt)
             x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
             mx.eval(x)
+            if os.environ.get("EXO_DTYPE_PROBE") == "1" and not _PROBED:
+                _probe(f"PipelineFirstLayer r={self.r} post-recv x.dtype={x.dtype}")
         return self.original_layer(x, *args, **kwargs)
 
 
@@ -174,6 +231,9 @@ class PipelineLastLayer(CustomMlxLayer):
         cache = self.original_layer_signature.bind_partial(
             x, *args, **kwargs
         ).arguments.get("cache", None)
+
+        if os.environ.get("EXO_DTYPE_PROBE") == "1" and not _PROBED:
+            _probe(f"PipelineLastLayer r={self.r}/{self.s} in x.dtype={x.dtype} shape={x.shape}")
 
         output: mx.array = self.original_layer(x, *args, **kwargs)
 

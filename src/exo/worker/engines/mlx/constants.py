@@ -81,15 +81,28 @@ KV_BITS_BY_FAMILY: dict[str, int] = {
 #     bounding the transient per-chunk, 512 is stale over-caution; 2048 is
 #     the new default, to be confirmed or reverted by the 2026-09-02 soak.
 #
+#   - qwen3.5 : 4096 is not the default leaking through, it is the MEASURED
+#     value (2026-06-19 A/B: +115% prefill tok/s @11k vs the old 512 cap, no
+#     peak-memory cost, bit-identical output — the family is hybrid attention,
+#     45/60 layers recurrent GatedDeltaNet, so there is no chunk x seq^2
+#     transient to cap). It has ArraysCache entries (deltanet + PLE slots), so
+#     any "has SSM caches" heuristic catches it wrongly; a blanket SSM->512 on
+#     2026-09-02 made its prefill unusably slow (8x the chunks, each with a
+#     blocking per-chunk eval over the TCP ring). This table replaced that.
+#     2026-09-07: made EXPLICIT here rather than left to the 4096 default.
+#     Both launchers used to export EXO_PREFILL_STEP_SIZE=4096, and when the
+#     M3 dropped its default (2026-09-02) but the M4 mirror did not, the two
+#     ranks disagreed for any family the table DID cover (GLM-5.3: 2048 vs
+#     4096) — a live rank desync that went unnoticed because the family this
+#     was tuned for happened to agree by accident. An entry here is
+#     rank-consistent by construction: each rank derives it from the model id.
+#
 # NOT in the table (runs the 4096 default):
-#   - Qwen3.5-397B (qwen4_exp) : has ArraysCache entries too (deltanet +
-#     PLE slots), so any "has SSM caches" heuristic catches it — but its
-#     recurrent state is small and it served 4096 chunks for weeks.
-#     2026-09-02: a blanket SSM->512 default made its prefill unusably
-#     slow (8x the chunks, each with a blocking per-chunk eval over the
-#     TCP ring). This table replaced that heuristic.
+#   - V4-Flash (all-dense) wants an explicit 512; it has no measured table
+#     entry yet, so it still needs EXO_PREFILL_STEP_SIZE set on EVERY node.
 PREFILL_STEP_SIZE_BY_FAMILY: dict[str, int] = {
     "glm-5.3": 2048,
+    "qwen3.5": 4096,
 }
 
 
