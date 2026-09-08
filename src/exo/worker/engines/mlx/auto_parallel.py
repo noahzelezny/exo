@@ -1,5 +1,4 @@
 import os
-import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator
 from functools import partial
@@ -135,15 +134,6 @@ class CustomMlxLayer(nn.Module):
                 return getattr(original_layer, name)
 
 
-# Temporary dtype instrument (2026-09-07). See PipelineFirstLayer.__call__.
-_PROBED = False
-
-
-def _probe(msg: str) -> None:
-    global _PROBED
-    print(f"[dtype-probe] {msg}", file=sys.stderr, flush=True)
-
-
 class PipelineFirstLayer(CustomMlxLayer):
     def __init__(
         self,
@@ -197,8 +187,6 @@ class PipelineFirstLayer(CustomMlxLayer):
             # We want to avoid GPU timeout errors by evalling the distributed operation
             # so that it stays on CPU, which does not have a timeout.
             mx.eval(x)
-            if os.environ.get("EXO_DTYPE_PROBE") == "1" and not _PROBED:
-                _probe(f"PipelineFirstLayer r={self.r} pre-recv x.dtype={x.dtype} shape={x.shape}")
             dt = self._recv_dtype()
             if dt is not None and x.dtype != dt:
                 # Only shape/dtype are read off the template; the values are
@@ -206,8 +194,6 @@ class PipelineFirstLayer(CustomMlxLayer):
                 x = x.astype(dt)
             x = mx.distributed.recv_like(x, (self.r - 1), group=self.group)
             mx.eval(x)
-            if os.environ.get("EXO_DTYPE_PROBE") == "1" and not _PROBED:
-                _probe(f"PipelineFirstLayer r={self.r} post-recv x.dtype={x.dtype}")
         return self.original_layer(x, *args, **kwargs)
 
 
@@ -232,8 +218,6 @@ class PipelineLastLayer(CustomMlxLayer):
             x, *args, **kwargs
         ).arguments.get("cache", None)
 
-        if os.environ.get("EXO_DTYPE_PROBE") == "1" and not _PROBED:
-            _probe(f"PipelineLastLayer r={self.r}/{self.s} in x.dtype={x.dtype} shape={x.shape}")
 
         output: mx.array = self.original_layer(x, *args, **kwargs)
 
