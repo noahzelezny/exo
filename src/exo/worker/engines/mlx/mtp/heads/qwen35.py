@@ -133,7 +133,13 @@ class MTPHeadQwen35:
     # ---------------------------------------------------------------- build
     def _norm(self, w, shift):
         n = nn.RMSNorm(self.D, eps=self.eps)
-        n.weight = w.astype(mx.float32) + shift
+        # Accumulate the delta shift in float32, then come back to the
+        # weight's OWN dtype. Leaving the gain float32 promotes the block's
+        # hidden states, hence q/k, to float32 — and at head_dim 256 MLX's
+        # steel attention kernel then wants 53760 B of threadgroup memory
+        # against a 32768 B cap, so it fails to LOAD (not to fit in RAM).
+        # The trunk stores every norm gain as bf16; so must the head.
+        n.weight = (w.astype(mx.float32) + shift).astype(w.dtype)
         return n
 
     def load_graft(self, g):
@@ -169,7 +175,9 @@ class MTPHeadQwen35:
 
         for k in list(layer_w):
             if shift and any(("layers.0." + k).endswith(s) for s in _NORM_KEYS):
-                layer_w[k] = layer_w[k].astype(mx.float32) + shift
+                # dtype-preserving for the same reason as _norm above
+                layer_w[k] = (layer_w[k].astype(mx.float32)
+                              + shift).astype(layer_w[k].dtype)
 
         slots = {k for k, _ in tree_flatten(self.block.parameters())}
         unmatched = sorted(set(layer_w) - slots)
@@ -225,6 +233,17 @@ class MTPHeadQwen35:
     @classmethod
     def from_sidecar(cls, model, arch, path):
         w = mx.load(str(path))
+        # Sidecars built before 2026-09-07 stored the shifted norm gains in
+        # float32 (the accumulate dtype leaked into the file). Seven tensors
+        # — the two layernorms, q_norm/k_norm, and the three pre-fc norms —
+        # are enough to promote the head's attention to float32, which at
+        # head_dim 256 exceeds Metal's 32 KB threadgroup cap and aborts the
+        # runner with "Unable to load kernel steel_attention_float32_...".
+        # Everything else in the head is bf16, so follow it.
+        _dt = w["fc.weight"].dtype
+        if _dt != mx.float32:
+            w = {k: (v.astype(_dt) if v.dtype == mx.float32 else v)
+                 for k, v in w.items()}
         meta = mx.load(str(path), return_metadata=True)[1]
         cfg = json.loads(meta.get("vqlab_mtp", "{}"))
         head = cls(model, arch,
