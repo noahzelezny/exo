@@ -303,7 +303,7 @@ exo supports several environment variables for configuration:
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
-| `EXO_MTP` | Enable MTP (multi-token prediction) speculative decoding on models that ship an `mtp-head-q6.safetensors` sidecar (Qwen3.8-Flash, GLM-5.3-Flash, Qwen3.5-397B rungs from TheDrainFlorist). Set on the WORKER processes before launch; the head loads at instance build, so changing it requires an exo restart. Unset = drafting fully inert. | unset |
+| `EXO_MTP` | Enable MTP (multi-token prediction) speculative decoding on models that ship an `mtp-head-q6.safetensors` sidecar (Qwen3.8-Flash, GLM-5.3-Flash, Qwen3.5-397B rungs from TheDrainFlorist). Easiest spelling: launch each node with `exo --mtp` (same mechanism). The head loads at instance build, so changing it requires an exo restart. NOTE: with MTP enabled, requests are served sequentially — the batch engine has no MTP path — so leave it off for concurrent / multi-agent serving. Unset = drafting fully inert. | unset |
 
 **Example usage:**
 

@@ -281,6 +281,10 @@ def main():
         raise SystemExit(1) from exception
 
     args = Args.parse()
+    if args.mtp:
+        # Must land before mp.set_start_method / any spawn: workers read
+        # EXO_MTP at model build (worker/engines/mlx/builder.py).
+        os.environ["EXO_MTP"] = "1"
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     target = min(max(soft, 65535), hard)
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
@@ -352,6 +356,10 @@ class Args(FrozenModel):
     no_worker: bool = False
     no_downloads: bool = False
     offline: bool = os.getenv("EXO_OFFLINE", "false").lower() == "true"
+    # --mtp is sugar for EXO_MTP=1: builder.py and the mtp package read the
+    # ENV, and runner processes inherit it, so the flag just sets the env
+    # before anything spawns (see main()). One mechanism, two spellings.
+    mtp: bool = os.getenv("EXO_MTP") == "1"
     no_batch: bool = False
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
     no_stdio: bool = False
@@ -412,6 +420,16 @@ class Args(FrozenModel):
             "--no-downloads",
             action="store_true",
             help="Disable the download coordinator (node won't download models)",
+        )
+        parser.add_argument(
+            "--mtp",
+            action="store_true",
+            default=os.getenv("EXO_MTP") == "1",
+            help="Enable MTP speculative decoding on models that ship an "
+            "mtp-head sidecar (equivalent to EXO_MTP=1; set on each node). "
+            "Note: drafting routes through the sequential generator -- the "
+            "batch engine has no MTP path yet, so leave this off for "
+            "concurrent / multi-agent serving.",
         )
         parser.add_argument(
             "--offline",
