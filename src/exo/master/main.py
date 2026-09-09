@@ -13,6 +13,8 @@ from exo.master.placement import (
 from exo.master.placement_utils import find_ip_prioritised
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
+import os
+
 from exo.shared.types.commands import (
     AddCustomModelCard,
     CreateInstance,
@@ -73,6 +75,14 @@ from exo.utils.channels import Receiver, Sender
 from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.event_buffer import MultiSourceBuffer
 from exo.utils.task_group import TaskGroup
+
+# Events per RequestEventLog response. Each batch costs one round trip
+# gated by the replica's nack backoff, so this is the dominant term in
+# replica catch-up time. 20000 turns a 400k-event replay from 400+ round
+# trips into ~20. EXO_EVENT_LOG_REPLAY_BATCH overrides.
+_EVENT_LOG_REPLAY_BATCH = int(
+    os.environ.get("EXO_EVENT_LOG_REPLAY_BATCH", "20000")
+)
 
 
 def _prefill_endpoint_for(state: State, decode_instance_id: InstanceId) -> str | None:
@@ -443,8 +453,23 @@ class Master:
                             )
                         case RequestEventLog():
                             # We should just be able to send everything, since other buffers will ignore old messages
-                            # rate limit to 1000 at a time
-                            end = min(command.since_idx + 1000, len(self._event_log))
+                            # Batched, because a replica catching up must make one
+                            # ROUND TRIP per batch and each is gated by its nack
+                            # backoff (event_router: 0.5s base, 10s cap). At the old
+                            # hardcoded 1000 a 400k-event log needed 400+ round trips
+                            # and several minutes to replay -- long enough that a
+                            # restart mid-replay starts over from zero, which
+                            # livelocked the M4 on 2026-09-09: it never left
+                            # "preparing" because it never finished a replay.
+                            # The log has no size-based rotation (indices are
+                            # absolute, so rotating mid-session would shift them out
+                            # from under replicas), so it grows all session -- 294 MB
+                            # in ~10 hours of placement activity. Batch size is the
+                            # lever that does not touch the index contract.
+                            end = min(
+                                command.since_idx + _EVENT_LOG_REPLAY_BATCH,
+                                len(self._event_log),
+                            )
                             for i, event in enumerate(
                                 self._event_log.read_range(command.since_idx, end),
                                 start=command.since_idx,
