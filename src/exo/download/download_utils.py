@@ -86,6 +86,9 @@ _RATE_LIMIT_MAX_SLEEP_SECS = 300.0
 # 24h. Manually clear the cache (or `delete_model`) to force a refresh.
 _FILE_LIST_CACHE_TTL_SECS = 24 * 60 * 60
 
+# model_ids already reported as offline-local, so the steady state is quiet.
+_OFFLINE_FILE_LIST_SEEN: set = set()
+
 
 async def _build_auth_error_message(status_code: int, model_id: ModelId) -> str:
     token = await get_hf_token()
@@ -407,9 +410,20 @@ async def fetch_file_list_with_cache(
             model_id, recursive
         )
         if local_file_list is not None:
-            logger.warning(
-                f"No internet and no cached file list for {model_id} - using local file list"
-            )
+            # Once per model per process, not once per catalog scan. In
+            # offline mode this is the DESIGNED path, not a fault: every
+            # scan hit it for every model, at WARNING, and grew exo-m4.log
+            # to 2.0 GB (~80k of 200k sampled lines). Keep the first sighting
+            # visible, drop the repeats to debug.
+            if model_id not in _OFFLINE_FILE_LIST_SEEN:
+                _OFFLINE_FILE_LIST_SEEN.add(model_id)
+                logger.info(
+                    f"Offline: using local file list for {model_id}"
+                )
+            else:
+                logger.debug(
+                    f"Offline: using local file list for {model_id}"
+                )
             return local_file_list
         raise FileNotFoundError(
             f"No internet connection and no cached file list for {model_id}"
