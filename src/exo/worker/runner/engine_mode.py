@@ -17,8 +17,9 @@ Control plane, stage 0: a per-node mode file — `~/.exo/engine-mode`
 
     sequential   one request at a time, drafting when the model can
     batch        concurrent serving, no drafting
-    auto         batch when ≥2 requests are waiting, sequential otherwise
-                 (the contextual mode: a swarm flips it, a chat flips it back)
+    auto         batch as soon as another request is WAITING at a boundary,
+                 sequential when a request starts alone (the contextual mode:
+                 a sub-agent or swarm flips it, the next lone chat flips back)
 
 Absent or unreadable file = the launch-time rule, exactly as before. The file
 is read at each task boundary, so an operator (or Scout) writes one word and
@@ -35,8 +36,14 @@ from typing import Literal
 
 EngineMode = Literal["sequential", "batch"]
 MODES = ("sequential", "batch", "auto")
-# ≥ this many requests waiting at a boundary and `auto` picks the batch engine.
-AUTO_BATCH_THRESHOLD = 2
+# `auto` picks the batch engine when at least this many OTHER requests are
+# waiting at a boundary. 1, measured 2026-09-17 on Qwen3.8-Flash-Next-VQ-4.4bpw
+# (M4, 500-token generations): sequential+MTP alone 26.3 tok/s; batch alone
+# 19.6; batch x2 16.6 each (33.2 aggregate, two done in 30s vs 38s serial);
+# batch x3 15.0 each (44.9 aggregate). A waiting sub-agent therefore costs the
+# chat ~1/3 of its decode while both run, but starts at once instead of
+# queueing ~20s -- the trade delegation exists for. Each switch is ~3-4s.
+AUTO_BATCH_THRESHOLD = 1
 
 
 def mode_file() -> Path:
@@ -57,13 +64,15 @@ def read_mode(path: Path | None = None) -> str | None:
 def resolve_target(
     mode: str | None,
     *,
-    pending: int,
+    waiting: int,
     mtp_available: bool,
     current: EngineMode,
 ) -> EngineMode | None:
     """The engine the runner should be on for the next task(s), or None to stay.
 
-    `pending` counts requests that are waiting (none started). A sequential
+    `waiting` counts OTHER requests queued at this boundary: 0 at the idle
+    boundary where one request is about to start alone, len(queue) at a
+    finish boundary where the rest are still waiting. A sequential
     engine for a model that cannot draft is the measured 4x decode loss with
     nothing bought, so `auto` never picks it for such a model and an explicit
     "sequential" is honored only when drafting is available.
@@ -73,7 +82,7 @@ def resolve_target(
     if mode == "auto":
         want: EngineMode = (
             "batch"
-            if pending >= AUTO_BATCH_THRESHOLD or not mtp_available
+            if waiting >= AUTO_BATCH_THRESHOLD or not mtp_available
             else "sequential"
         )
     elif mode == "sequential":

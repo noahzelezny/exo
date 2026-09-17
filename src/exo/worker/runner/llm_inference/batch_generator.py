@@ -5,6 +5,7 @@ from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
+import jinja2
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
@@ -64,6 +65,16 @@ class GeneratorQueue[T]:
                 yield self._q.popleft()
 
 
+# A request the chat template refuses (2026-09-17: Qwen3.8's template raises
+# on reasoning_effort="high" -- it accepts xhigh/medium/low) is that REQUEST's
+# error, not the runner's. Re-raising it killed the runner, the worker rebuilt
+# it, and after EXO_MAX_INSTANCE_RETRIES the instance was deleted -- 2,864
+# times in one node's log, every time a client sent a value the template did
+# not know. The task gets an ErrorChunk and a FinishedResponse; the runner and
+# every other queued task carry on.
+_REQUEST_ERRORS: tuple[type[BaseException], ...] = (jinja2.exceptions.TemplateError,)
+
+
 EXO_RUNNER_MUST_FAIL = "EXO RUNNER MUST FAIL"
 EXO_RUNNER_MUST_OOM = "EXO RUNNER MUST OOM"
 EXO_RUNNER_MUST_TIMEOUT = "EXO RUNNER MUST TIMEOUT"
@@ -105,6 +116,9 @@ class SequentialGenerator(Engine):
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
     _all_tasks: dict[TaskId, TextGeneration] = field(default_factory=dict, init=False)
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
+    # Tasks refused at prompt-build time (see _REQUEST_ERRORS): their
+    # FinishedResponse is yielded by the next step() so the runner drops them.
+    _refused: list[TaskId] = field(default_factory=list, init=False)
     _active: (
         tuple[
             TextGeneration,
@@ -168,14 +182,23 @@ class SequentialGenerator(Engine):
         if self._active is None:
             self.agree_on_tasks()
 
-            if self._queue:
+            # A refused task leaves _active None; keep taking from the queue so
+            # one bad request cannot stall the ones behind it.
+            while self._active is None and self._queue:
                 self._start_next()
-            else:
-                return map(
-                    lambda task: (task, CancelledResponse()), self._cancelled_tasks
+            if self._active is None:
+                refused = [(tid, FinishedResponse()) for tid in self._refused]
+                self._refused.clear()
+                return itertools.chain(
+                    refused,
+                    map(lambda task: (task, CancelledResponse()), self._cancelled_tasks),
                 )
 
         assert self._active is not None
+        refused_out: list[tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]] = [
+            (tid, FinishedResponse()) for tid in self._refused
+        ]
+        self._refused.clear()
 
         task, gen, queue, output_generator = self._active
         output: list[
@@ -207,6 +230,7 @@ class SequentialGenerator(Engine):
                 not isinstance(chunk[1], GenerationChunk) or self.device_rank == 0
             ),
             itertools.chain(
+                refused_out,
                 output,
                 map(lambda task: (task, CancelledResponse()), self._cancelled_tasks),
             ),
@@ -216,6 +240,11 @@ class SequentialGenerator(Engine):
         task = self._queue.popleft()
         try:
             gen = self._build_generator(task)
+        except _REQUEST_ERRORS as e:
+            logger.warning(f"request refused by the chat template: {e}")
+            self._send_error(task, e)
+            self._refused.append(task.task_id)
+            return
         except Exception as e:
             self._send_error(task, e)
             raise
@@ -433,6 +462,11 @@ class BatchGenerator(Engine):
             try:
                 uid = self._start_task(task)
             except PrefillCancelled:
+                continue
+            except _REQUEST_ERRORS as e:
+                logger.warning(f"request refused by the chat template: {e}")
+                self._send_error(task, e)
+                echo_output.append((task.task_id, FinishedResponse()))
                 continue
             except Exception as e:
                 self._send_error(task, e)

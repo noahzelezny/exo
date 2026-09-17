@@ -302,9 +302,10 @@ class Runner:
             case TextGeneration() | ImageEdits() | ImageGeneration() if isinstance(
                 self.current_status, RunnerReady
             ):
-                # Fully idle boundary: one request is about to start. `auto`
-                # flips a batch engine back to sequential+drafting here.
-                self._maybe_switch_engine(pending=1)
+                # Fully idle boundary: one request is about to start, nothing
+                # waiting. `auto` flips a batch engine back to sequential+
+                # drafting here.
+                self._maybe_switch_engine(waiting=0)
                 return_code = self.handle_generation_tasks(starting_task=task)
                 if return_code == ExitCode.Shutdown:
                     return
@@ -367,7 +368,7 @@ class Runner:
             # engine starts the next one on its NEXT step): the boundary where
             # a waiting fan-out can be moved onto the batch engine.
             if finished and self.active_tasks and not self.generator.in_flight():
-                self._maybe_switch_engine(pending=len(self.active_tasks))
+                self._maybe_switch_engine(waiting=len(self.active_tasks))
 
             try:
                 item = self._work_queue.get_nowait()
@@ -406,7 +407,7 @@ class Runner:
         mode = getattr(engine, "engine_mode", None)
         return mode if mode in ("sequential", "batch") else None
 
-    def _maybe_switch_engine(self, *, pending: int) -> bool:
+    def _maybe_switch_engine(self, *, waiting: int) -> bool:
         """Rebuild the engine in the mode the operator asked for, if it differs.
 
         Called only at task boundaries where nothing is mid-generation; every
@@ -430,7 +431,7 @@ class Runner:
             return False
         target = em.resolve_target(
             mode,
-            pending=pending,
+            waiting=waiting,
             mtp_available=bool(builder.mtp_available()),  # type: ignore[attr-defined]
             current=self._engine_mode,  # type: ignore[arg-type]
         )
@@ -456,7 +457,7 @@ class Runner:
         for task in self.active_tasks.values():
             self.generator.submit(task)
         logger.info(
-            f"engine mode -> {target} (mode={mode}, pending={pending}, "
+            f"engine mode -> {target} (mode={mode}, waiting={waiting}, "
             f"re-submitted={len(self.active_tasks)}) in {time.time() - t0:.1f}s"
         )
         return True

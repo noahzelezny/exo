@@ -31,22 +31,22 @@ from .test_event_ordering import CHAT_PARAMS, EventCollector, MockLoadOutput, no
 # ----------------------------------------------------------------- decision
 
 @pytest.mark.parametrize(
-    "mode,pending,mtp,current,want",
+    "mode,waiting,mtp,current,want",
     [
         (None, 5, True, "sequential", None),            # no file: launch rule stands
-        ("auto", 1, True, "batch", "sequential"),       # a lone chat drafts
-        ("auto", 1, True, "sequential", None),
-        ("auto", 2, True, "sequential", "batch"),       # a fan-out batches
+        ("auto", 0, True, "batch", "sequential"),       # a lone chat drafts
+        ("auto", 0, True, "sequential", None),
+        ("auto", 1, True, "sequential", "batch"),       # anyone waiting: batch
         ("auto", 5, True, "batch", None),
-        ("auto", 1, False, "sequential", "batch"),      # can't draft: never sit sequential
+        ("auto", 0, False, "sequential", "batch"),      # can't draft: never sit sequential
         ("sequential", 9, True, "batch", "sequential"),
-        ("sequential", 1, False, "batch", None),        # honored only when drafting exists
-        ("batch", 1, True, "sequential", "batch"),
-        ("batch", 1, True, "batch", None),
+        ("sequential", 0, False, "batch", None),        # honored only when drafting exists
+        ("batch", 0, True, "sequential", "batch"),
+        ("batch", 0, True, "batch", None),
     ],
 )
-def test_resolve_target(mode, pending, mtp, current, want):
-    assert em.resolve_target(mode, pending=pending, mtp_available=mtp, current=current) == want
+def test_resolve_target(mode, waiting, mtp, current, want):
+    assert em.resolve_target(mode, waiting=waiting, mtp_available=mtp, current=current) == want
 
 
 def test_read_mode_file(tmp_path, monkeypatch):
@@ -174,14 +174,16 @@ def test_auto_moves_a_waiting_fanout_onto_the_batch_engine(monkeypatch, tmp_path
         r._work_queue.put(_chat(i))
     r.handle_generation_tasks(starting_task=_chat(1))
 
-    # Switched exactly once, to batch, over the SAME prefix cache, and the
-    # tasks still waiting were re-submitted there; the one mid-generation at
-    # each earlier boundary never was.
+    # Switched exactly once, to batch, at the first finish with someone
+    # waiting (t2), over the SAME prefix cache; t2 was re-submitted there and
+    # t3/t4 arrived on the batch engine directly. t1 ran sequential and was
+    # never re-submitted.
     assert [x["engine_mode"] for x in b.builds] == [None, "batch"]
     assert b.builds[1]["kv_prefix_cache"] is seq.kv_prefix_cache
     batch = b.engines[1]
     assert batch.warmed and seq.closed
-    assert set(batch.submitted) == {TaskId("t3"), TaskId("t4")}
+    assert set(batch.submitted) == {TaskId("t2"), TaskId("t3"), TaskId("t4")}
+    assert seq.submitted == [TaskId("t1"), TaskId("t2")]
     assert r._engine_mode == "batch"
     assert {TaskId(f"t{i}") for i in (1, 2, 3, 4)} <= _completed(events)
 
@@ -213,7 +215,7 @@ def test_sharded_instance_is_never_switched(monkeypatch, tmp_path):
     monkeypatch.setenv("EXO_ENGINE_MODE_FILE", str(f))
     b = FakeBuilder(world=2)
     r, _ = _ready_runner(monkeypatch, b)
-    assert r._maybe_switch_engine(pending=1) is False
+    assert r._maybe_switch_engine(waiting=0) is False
     assert len(b.builds) == 1
 
 
@@ -223,7 +225,7 @@ def test_switch_refuses_while_a_task_is_mid_generation(monkeypatch, tmp_path):
     b = FakeBuilder()
     r, _ = _ready_runner(monkeypatch, b)
     b.engines[0].started = _chat(9)
-    assert r._maybe_switch_engine(pending=3) is False
+    assert r._maybe_switch_engine(waiting=3) is False
     assert len(b.builds) == 1
 
 
@@ -233,4 +235,4 @@ def test_builder_without_modes_is_left_alone(monkeypatch, tmp_path):
     b = FakeBuilder()
     b.supports_engine_modes = False
     r, _ = _ready_runner(monkeypatch, b)
-    assert r._maybe_switch_engine(pending=5) is False
+    assert r._maybe_switch_engine(waiting=5) is False
