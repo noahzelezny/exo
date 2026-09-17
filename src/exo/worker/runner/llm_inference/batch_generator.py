@@ -191,8 +191,11 @@ class SequentialGenerator(Engine):
         except (StopIteration, PrefillCancelled):
             output.append((task.task_id, FinishedResponse()))
             self._active = None
-            if self._queue:
-                self._start_next()
+            # The next queued task starts on the NEXT step(), not here. The
+            # gap is one runner iteration and it is the boundary the
+            # engine-mode switch needs: with an eager start the runner saw
+            # `in_flight` again before it could look, and a four-request
+            # fan-out ran serially on the first live test (2026-09-17).
 
         except Exception as e:
             self._send_error(task, e)
