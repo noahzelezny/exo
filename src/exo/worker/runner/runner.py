@@ -110,6 +110,10 @@ class Runner:
         self.setup_start_time = time.time()
 
         self.generator: Builder | Engine = builder
+        # Kept after build: the engine-mode switch rebuilds engines over the
+        # builder's loaded model (exo/worker/runner/engine_mode.py).
+        self._builder: Builder = builder
+        self._engine_mode: str | None = None  # "sequential" | "batch" once built
 
         self.seen: set[TaskId] = set()
         self.active_tasks: dict[
@@ -269,6 +273,7 @@ class Runner:
                     )
 
                 self.generator = self.generator.build()
+                self._engine_mode = self._mode_of(self.generator)
 
                 self.send_task_status(task.task_id, TaskStatus.Complete)
                 self.update_status(RunnerLoaded())
@@ -297,6 +302,9 @@ class Runner:
             case TextGeneration() | ImageEdits() | ImageGeneration() if isinstance(
                 self.current_status, RunnerReady
             ):
+                # Fully idle boundary: one request is about to start. `auto`
+                # flips a batch engine back to sequential+drafting here.
+                self._maybe_switch_engine(pending=1)
                 return_code = self.handle_generation_tasks(starting_task=task)
                 if return_code == ExitCode.Shutdown:
                     return
@@ -355,6 +363,12 @@ class Runner:
             for task_id in finished:
                 self.active_tasks.pop(task_id, None)
 
+            # A task just finished and the rest are still queued (a sequential
+            # engine starts the next one on its NEXT step): the boundary where
+            # a waiting fan-out can be moved onto the batch engine.
+            if finished and self.active_tasks and not self.generator.in_flight():
+                self._maybe_switch_engine(pending=len(self.active_tasks))
+
             try:
                 item = self._work_queue.get_nowait()
             except queue.Empty:
@@ -384,6 +398,68 @@ class Runner:
         logger.info("runner ready")
 
         return ExitCode.AllTasksComplete
+
+    @staticmethod
+    def _mode_of(engine: object) -> str | None:
+        # MlxBuilder stamps `engine_mode` on what it builds; anything else
+        # (image engines, foreign builders) reports None and is never switched.
+        mode = getattr(engine, "engine_mode", None)
+        return mode if mode in ("sequential", "batch") else None
+
+    def _maybe_switch_engine(self, *, pending: int) -> bool:
+        """Rebuild the engine in the mode the operator asked for, if it differs.
+
+        Called only at task boundaries where nothing is mid-generation; every
+        task still in `active_tasks` is merely queued and is re-submitted to
+        the new engine. Weights, tokenizer and the pooled prefix cache are
+        shared with the engine being replaced — the cost is one warmup, not a
+        reload. Returns True when a switch happened.
+        """
+        from exo.worker.runner import engine_mode as em
+
+        builder = self._builder
+        if not getattr(builder, "supports_engine_modes", False):
+            return False
+        if self._engine_mode is None or not isinstance(self.generator, Engine):
+            return False
+        group = getattr(builder, "group", None)
+        if group is not None and group.size() > 1:
+            return False  # ranks have no shared file to agree on; never switch
+        mode = em.read_mode()
+        if mode is None:
+            return False
+        target = em.resolve_target(
+            mode,
+            pending=pending,
+            mtp_available=bool(builder.mtp_available()),  # type: ignore[attr-defined]
+            current=self._engine_mode,  # type: ignore[arg-type]
+        )
+        if target is None:
+            return False
+        if self.generator.in_flight():
+            logger.warning(
+                f"engine mode {mode!r} wants {target} but a task is mid-generation; "
+                "keeping the current engine until the next boundary"
+            )
+            return False
+
+        old = self.generator
+        t0 = time.time()
+        new = builder.build(  # type: ignore[call-arg]
+            engine_mode=target,
+            kv_prefix_cache=getattr(old, "kv_prefix_cache", None),
+        )
+        new.warmup()
+        old.close()
+        self.generator = new
+        self._engine_mode = target
+        for task in self.active_tasks.values():
+            self.generator.submit(task)
+        logger.info(
+            f"engine mode -> {target} (mode={mode}, pending={pending}, "
+            f"re-submitted={len(self.active_tasks)}) in {time.time() - t0:.1f}s"
+        )
+        return True
 
     def send_chunk(
         self,

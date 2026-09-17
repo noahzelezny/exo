@@ -304,6 +304,7 @@ exo supports several environment variables for configuration:
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
 | `EXO_MTP` | Enable MTP (multi-token prediction) speculative decoding on models that ship an `mtp-head-q6.safetensors` sidecar (Qwen3.8-Flash, GLM-5.3-Flash, Qwen3.5-397B rungs from TheDrainFlorist). Easiest spelling: launch each node with `exo --mtp` (same mechanism). The head loads at instance build, so changing it requires an exo restart. NOTE: with MTP enabled, requests are served sequentially — the batch engine has no MTP path — so leave it off for concurrent / multi-agent serving. Unset = drafting fully inert. | unset |
+| `EXO_ENGINE_MODE_FILE` | Path of the per-node engine-mode file (default `~/.exo/engine-mode`). Holding `sequential`, `batch` or `auto`, it switches a single-node instance between the sequential engine (one request at a time, MTP drafting when the model ships a head) and the batch engine (concurrent serving, no drafting) at the next task boundary — no restart, no reload; weights and the prefix cache carry over. `auto` batches when ≥2 requests are waiting and drafts otherwise. Absent or unrecognised = the launch-time rule above. | unset |
 
 **Example usage:**
 

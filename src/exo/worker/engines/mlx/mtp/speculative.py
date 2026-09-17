@@ -59,7 +59,23 @@ _HEAD_CACHE: dict[str, Any] = {}
 _HEAD_FAILED: set[str] = set()
 
 
+# Runtime override for drafting, set by the runner's engine-mode switch
+# (exo/worker/runner/engine_mode.py). None = defer to EXO_MTP as before; True /
+# False = this runner has been switched into sequential-with-drafting or into
+# the batch engine at a task boundary and drafting must follow the engine, not
+# the launch environment. Process-local on purpose: the runner is its own
+# process and the switch is decided there.
+_RUNTIME_MTP: bool | None = None
+
+
+def set_mtp_runtime(enabled: bool | None) -> None:
+    global _RUNTIME_MTP
+    _RUNTIME_MTP = enabled
+
+
 def mtp_enabled() -> bool:
+    if _RUNTIME_MTP is not None:
+        return _RUNTIME_MTP
     return os.environ.get("EXO_MTP") == "1"
 
 

@@ -300,6 +300,11 @@ class SequentialGenerator(Engine):
     def close(self) -> None:
         del self.model, self.tokenizer, self.group
 
+    def in_flight(self) -> bool:
+        # Only the ACTIVE tuple holds generation state; _queue/_maybe_queue are
+        # re-submittable to another engine.
+        return self._active is not None
+
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
         cache = run_prefill_for_request(
             model=self.model,
@@ -585,6 +590,9 @@ class BatchGenerator(Engine):
     def close(self) -> None:
         self._gen.close()
         del self.model, self.tokenizer, self.group
+
+    def in_flight(self) -> bool:
+        return bool(self._active_tasks)
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
         cache = run_prefill_for_request(

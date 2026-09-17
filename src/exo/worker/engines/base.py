@@ -39,6 +39,17 @@ class Engine(ABC):
     @abstractmethod
     def close(self) -> None: ...
 
+    def in_flight(self) -> bool:
+        """True while some submitted task has STARTED generating on this engine.
+
+        The runner's engine-mode switch (runner/engine_mode.py) may replace the
+        engine only when nothing is mid-generation: a started task owns KV
+        state inside the engine and cannot be re-submitted elsewhere, while a
+        merely queued one can. Default is the conservative answer — an engine
+        that does not report never gets swapped.
+        """
+        return True
+
     @abstractmethod
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None: ...
 
@@ -58,3 +69,14 @@ class Builder(ABC):
 
     @abstractmethod
     def close(self) -> None: ...
+
+    def in_flight(self) -> bool:
+        """True while some submitted task has STARTED generating on this engine.
+
+        The runner's engine-mode switch (runner/engine_mode.py) may replace the
+        engine only when nothing is mid-generation: a started task owns KV
+        state inside the engine and cannot be re-submitted elsewhere, while a
+        merely queued one can. Default is the conservative answer — an engine
+        that does not report never gets swapped.
+        """
+        return True
