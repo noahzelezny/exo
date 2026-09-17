@@ -254,6 +254,21 @@ def _load_head(model: Model, model_id: str) -> Any | None:
         return None
 
 
+def load_batch_head(model: Model, model_id: str | None) -> Any | None:
+    """The head for the batch engine's drafting path (mtp/batch_loop.py),
+    or None when this model cannot draft: same registry + sidecar gate and
+    the same family shim as `plan_mtp`, minus the topology test — the
+    builder only asks on single-node instances."""
+    if not model_id:
+        return None
+    try:
+        spec = resolve(model)
+    except KeyError:
+        return None
+    _maybe_install_glm5_shim(spec)
+    return _load_head(model, model_id)
+
+
 def _pipeline_prefill_ctx(model: Model) -> Callable[[], Any]:
     """Factory for the context the MTP loop wraps its prompt chunks in.
 

@@ -16,8 +16,10 @@ Control plane, stage 0: a per-node mode file — `~/.exo/engine-mode`
 (override with EXO_ENGINE_MODE_FILE) — holding one word:
 
     sequential   one request at a time, drafting when the model can
-    batch        concurrent serving, no drafting
-    auto         batch as soon as another request is WAITING at a boundary,
+    batch        concurrent serving; drafting too on a single-node instance
+                 (mtp/batch_loop.py), plain batching on a sharded one
+    auto         where the batch engine drafts: batch, always. Otherwise batch
+                 as soon as another request is WAITING at a boundary and
                  sequential when a request starts alone (the contextual mode:
                  a sub-agent or swarm flips it, the next lone chat flips back)
 
@@ -67,6 +69,7 @@ def resolve_target(
     waiting: int,
     mtp_available: bool,
     current: EngineMode,
+    batch_drafts: bool = False,
 ) -> EngineMode | None:
     """The engine the runner should be on for the next task(s), or None to stay.
 
@@ -76,13 +79,20 @@ def resolve_target(
     engine for a model that cannot draft is the measured 4x decode loss with
     nothing bought, so `auto` never picks it for such a model and an explicit
     "sequential" is honored only when drafting is available.
+
+    `batch_drafts`: the batch engine itself drafts (mtp/batch_loop.py, single-
+    node instances). Then `auto` has nothing to flip for: a lone request on
+    the drafting batch engine decodes as the sequential loop would (measured
+    2026-09-17, Qwen3.8-Flash-Next-VQ-2.1bpw on the M3: 23.1 vs 22 tok/s,
+    identical tokens) and a waiter simply joins the batch, with no ~3s rebuild
+    at either boundary. An explicit "sequential" is still honored.
     """
     if mode is None:
         return None
     if mode == "auto":
         want: EngineMode = (
             "batch"
-            if waiting >= AUTO_BATCH_THRESHOLD or not mtp_available
+            if batch_drafts or waiting >= AUTO_BATCH_THRESHOLD or not mtp_available
             else "sequential"
         )
     elif mode == "sequential":

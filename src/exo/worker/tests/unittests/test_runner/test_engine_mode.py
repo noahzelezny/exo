@@ -49,6 +49,21 @@ def test_resolve_target(mode, waiting, mtp, current, want):
     assert em.resolve_target(mode, waiting=waiting, mtp_available=mtp, current=current) == want
 
 
+@pytest.mark.parametrize(
+    "mode,waiting,current,want",
+    [
+        ("auto", 0, "batch", None),            # a lone chat drafts ON the batch engine
+        ("auto", 0, "sequential", "batch"),    # ...so auto leaves sequential for good
+        ("auto", 3, "sequential", "batch"),
+        ("sequential", 0, "batch", "sequential"),   # explicit is still honored
+        ("batch", 0, "sequential", "batch"),
+    ],
+)
+def test_resolve_target_when_the_batch_engine_drafts(mode, waiting, current, want):
+    assert em.resolve_target(mode, waiting=waiting, mtp_available=True, current=current,
+                             batch_drafts=True) == want
+
+
 def test_read_mode_file(tmp_path, monkeypatch):
     f = tmp_path / "engine-mode"
     monkeypatch.setenv("EXO_ENGINE_MODE_FILE", str(f))

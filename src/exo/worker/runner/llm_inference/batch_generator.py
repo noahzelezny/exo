@@ -3,7 +3,7 @@ import time
 from collections import deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import jinja2
 import mlx.core as mx
@@ -32,6 +32,7 @@ from exo.worker.engines.mlx.cache import KVPrefixCache
 from exo.worker.engines.mlx.disaggregated.adapter import write_cache_to_wire
 from exo.worker.engines.mlx.disaggregated.serve import run_prefill_for_request
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
+from exo.worker.engines.mlx.generator.mtp_batch_generate import ExoMTPBatchGenerator
 from exo.worker.engines.mlx.generator.generate import (
     PrefillCancelled,
     mlx_generate,
@@ -367,13 +368,17 @@ class BatchGenerator(Engine):
     event_sender: MpSender[Event]
     check_for_cancel_every: int = 50
     vision_processor: VisionProcessor | None = None
+    # A loaded MTP head makes this a DRAFTING batch engine (ExoMTPBatchGenerator
+    # in place of ExoBatchGenerator): every row still batches, and each row
+    # also verifies one drafted token per step. None = the stock batch path.
+    mtp_head: Any = None
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
     _maybe_queue: list[TextGeneration] = field(default_factory=list, init=False)
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
     _all_tasks: dict[TaskId, TextGeneration] = field(default_factory=dict, init=False)
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
-    _gen: ExoBatchGenerator = field(init=False)
+    _gen: ExoBatchGenerator | ExoMTPBatchGenerator = field(init=False)
     _active_tasks: dict[
         int,
         tuple[
@@ -384,13 +389,25 @@ class BatchGenerator(Engine):
     ] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
-        self._gen = ExoBatchGenerator(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            group=self.group,
-            kv_prefix_cache=self.kv_prefix_cache,
-            vision_processor=self.vision_processor,
-        )
+        if self.mtp_head is not None:
+            self._gen = ExoMTPBatchGenerator(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                head=self.mtp_head,
+                vision_processor=self.vision_processor,
+            )
+        else:
+            self._gen = ExoBatchGenerator(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                group=self.group,
+                kv_prefix_cache=self.kv_prefix_cache,
+                vision_processor=self.vision_processor,
+            )
+
+    @property
+    def drafting(self) -> bool:
+        return self.mtp_head is not None
 
     def warmup(self):
         self.check_for_cancel_every = warmup_inference(

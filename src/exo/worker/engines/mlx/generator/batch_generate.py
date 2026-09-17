@@ -90,6 +90,111 @@ class _EngineTask:
     last_gen_token_time: float | None = None
 
 
+def emit_token(
+    state: _EngineTask,
+    token: int,
+    finish_reason: str | None,
+    *,
+    logprobs: Callable[[], tuple[float, list[TopLogprobItem]]] | None,
+) -> tuple[GenerationResponse, bool]:
+    """Fold one generated token into a task's state and build its response.
+
+    Everything per-token that is NOT the decode step lives here — streaming
+    detokenization, stop-sequence trimming, the end-of-request stats and
+    usage — so the plain batch engine and the drafting one (mtp_batch_generate)
+    produce identical responses from identical tokens. `logprobs` is called
+    only when the request asked for them. Returns (response, is_done).
+    """
+    now = time.perf_counter()
+    if state.first_gen_token_time is None:
+        state.first_gen_token_time = now
+    state.last_gen_token_time = now
+    if state.on_generation_token is not None:
+        state.on_generation_token()
+    if finish_reason != "stop":
+        state.detokenizer.add_token(token)
+    if finish_reason is not None:
+        state.detokenizer.finalize()
+    text = state.detokenizer.last_segment
+    state.completion_tokens += 1
+    if state.task_params.bench:
+        delta = now - state.first_gen_token_time
+        logger.debug(
+            f"[bench] uid={state.uid} tok#{state.completion_tokens} {text!r} t={delta:.4f}s"
+        )
+    state.generated_text_parts.append(text)
+    state.potential_stop_sequence_text += text
+
+    finish: FinishReason | None = cast(FinishReason | None, finish_reason)
+    task_params = state.task_params
+    stop_sequences = _stop_sequences(task_params)
+    max_stop_len = max((len(s) for s in stop_sequences), default=0)
+
+    if stop_sequences:
+        for stop_seq in stop_sequences:
+            if stop_seq in state.potential_stop_sequence_text:
+                stop_index = state.potential_stop_sequence_text.find(stop_seq)
+                text_before_stop = state.potential_stop_sequence_text[:stop_index]
+                chunk_start = len(state.potential_stop_sequence_text) - len(text)
+                text = text_before_stop[chunk_start:]
+                finish = "stop"
+                break
+
+    is_done = finish is not None
+
+    logprob: float | None = None
+    top_logprobs: list[TopLogprobItem] | None = None
+    if task_params.logprobs and logprobs is not None:
+        logprob, top_logprobs = logprobs()
+
+    stats: GenerationStats | None = None
+    usage: Usage | None = None
+    if is_done:
+        if state.completion_tokens > 1:
+            gen_span = state.last_gen_token_time - state.first_gen_token_time
+            generation_tps = (
+                (state.completion_tokens - 1) / gen_span if gen_span > 0 else 0.0
+            )
+        else:
+            generation_tps = 0.0
+
+        stats = GenerationStats(
+            prompt_tps=state.prefill_tps,
+            generation_tps=generation_tps,
+            prompt_tokens=len(state.all_prompt_tokens),
+            generation_tokens=state.completion_tokens,
+            peak_memory_usage=Memory.from_gb(mx.get_peak_memory() / 1e9),
+            prefix_cache_hit=state.prefix_cache_hit,
+        )
+        total_prompt_tokens = len(state.all_prompt_tokens)
+        usage = Usage(
+            prompt_tokens=total_prompt_tokens,
+            completion_tokens=state.completion_tokens,
+            total_tokens=total_prompt_tokens + state.completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=state.prefix_hit_length
+            ),
+            completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
+        )
+    elif max_stop_len > 0 and len(state.potential_stop_sequence_text) > max_stop_len:
+        state.potential_stop_sequence_text = state.potential_stop_sequence_text[
+            -max_stop_len:
+        ]
+
+    return (
+        GenerationResponse(
+            text=text,
+            token=token,
+            logprob=logprob,
+            top_logprobs=top_logprobs,
+            finish_reason=finish,
+            stats=stats,
+            usage=usage,
+        ),
+        is_done,
+    )
+
+
 @dataclass(eq=False)
 class ExoBatchGenerator:
     model: Model
@@ -354,125 +459,27 @@ class ExoBatchGenerator:
                 continue
 
             state = self._active_tasks[response.uid]
-            now = time.perf_counter()
-            if state.first_gen_token_time is None:
-                state.first_gen_token_time = now
-            state.last_gen_token_time = now
-            if state.on_generation_token is not None:
-                state.on_generation_token()
-            if response.finish_reason != "stop":
-                state.detokenizer.add_token(response.token)
-            if response.finish_reason is not None:
-                state.detokenizer.finalize()
-            text = state.detokenizer.last_segment
-            state.completion_tokens += 1
-            if state.task_params.bench:
-                delta = now - state.first_gen_token_time
-                logger.debug(
-                    f"[bench] uid={response.uid} tok#{state.completion_tokens} {text!r} t={delta:.4f}s"
-                )
-            state.generated_text_parts.append(text)
-            state.potential_stop_sequence_text += text
 
-            finish_reason: FinishReason | None = cast(
-                FinishReason | None, response.finish_reason
-            )
-            task_params = state.task_params
-            stop_sequences = _stop_sequences(task_params)
-            max_stop_len = max((len(s) for s in stop_sequences), default=0)
-
-            if stop_sequences:
-                for stop_seq in stop_sequences:
-                    if stop_seq in state.potential_stop_sequence_text:
-                        stop_index = state.potential_stop_sequence_text.find(stop_seq)
-                        text_before_stop = state.potential_stop_sequence_text[
-                            :stop_index
-                        ]
-                        chunk_start = len(state.potential_stop_sequence_text) - len(
-                            text
-                        )
-                        text = text_before_stop[chunk_start:]
-                        finish_reason = "stop"
-                        break
-
-            is_done = finish_reason is not None
-
-            logprob: float | None = None
-            top_logprobs: list[TopLogprobItem] | None = None
-            if task_params.logprobs:
-                precomputed = topk.for_uid(response.uid)
-                precomputed_indices, precomputed_values, precomputed_selected = (
-                    precomputed if precomputed is not None else (None, None, None)
-                )
+            def _logprobs(uid: int = response.uid, resp=response):
+                precomputed = topk.for_uid(uid)
+                pi, pv, ps = precomputed if precomputed is not None else (None, None, None)
                 with mx.stream(generation_stream):
-                    logprob, top_logprobs = extract_top_logprobs(
-                        logprobs=response.logprobs,
+                    return extract_top_logprobs(
+                        logprobs=resp.logprobs,
                         tokenizer=self.tokenizer,
-                        top_logprobs=task_params.top_logprobs or DEFAULT_TOP_LOGPROBS,
-                        selected_token=response.token,
-                        precomputed_indices=precomputed_indices,
-                        precomputed_values=precomputed_values,
-                        precomputed_selected=precomputed_selected,
+                        top_logprobs=state.task_params.top_logprobs or DEFAULT_TOP_LOGPROBS,
+                        selected_token=resp.token,
+                        precomputed_indices=pi,
+                        precomputed_values=pv,
+                        precomputed_selected=ps,
                     )
 
-            stats: GenerationStats | None = None
-            usage: Usage | None = None
-            if is_done:
-                if state.completion_tokens > 1:
-                    gen_span = state.last_gen_token_time - state.first_gen_token_time
-                    generation_tps = (
-                        (state.completion_tokens - 1) / gen_span
-                        if gen_span > 0
-                        else 0.0
-                    )
-                else:
-                    generation_tps = 0.0
-
-                stats = GenerationStats(
-                    prompt_tps=state.prefill_tps,
-                    generation_tps=generation_tps,
-                    prompt_tokens=len(state.all_prompt_tokens),
-                    generation_tokens=state.completion_tokens,
-                    peak_memory_usage=Memory.from_gb(mx.get_peak_memory() / 1e9),
-                    prefix_cache_hit=state.prefix_cache_hit,
-                )
-                total_prompt_tokens = len(state.all_prompt_tokens)
-                usage = Usage(
-                    prompt_tokens=total_prompt_tokens,
-                    completion_tokens=state.completion_tokens,
-                    total_tokens=total_prompt_tokens + state.completion_tokens,
-                    prompt_tokens_details=PromptTokensDetails(
-                        cached_tokens=state.prefix_hit_length
-                    ),
-                    completion_tokens_details=CompletionTokensDetails(
-                        reasoning_tokens=0
-                    ),
-                )
-
-            results.append(
-                (
-                    response.uid,
-                    GenerationResponse(
-                        text=text,
-                        token=response.token,
-                        logprob=logprob,
-                        top_logprobs=top_logprobs,
-                        finish_reason=finish_reason,
-                        stats=stats,
-                        usage=usage,
-                    ),
-                )
+            out, is_done = emit_token(
+                state, response.token, response.finish_reason, logprobs=_logprobs
             )
-
+            results.append((response.uid, out))
             if is_done:
                 del self._active_tasks[response.uid]
-            elif (
-                max_stop_len > 0
-                and len(state.potential_stop_sequence_text) > max_stop_len
-            ):
-                state.potential_stop_sequence_text = state.potential_stop_sequence_text[
-                    -max_stop_len:
-                ]
 
         _step_elapsed = time.perf_counter() - _step_tic
         _overhead = _step_elapsed - _next_elapsed

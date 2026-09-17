@@ -113,6 +113,15 @@ class MlxBuilder(Builder):
         assert self.inference_model
         return _mtp_available(self.inference_model, self.model_id)
 
+    def _single_node(self) -> bool:
+        return self.group is None or self.group.size() == 1
+
+    def batch_drafts(self) -> bool:
+        """Whether a batch engine built here drafts (mtp/batch_loop.py):
+        the model can draft and the instance is single-node. Read by the
+        runner's engine-mode switch."""
+        return self._single_node() and self.mtp_available()
+
     def build(
         self,
         engine_mode: str | None = None,
@@ -160,6 +169,7 @@ class MlxBuilder(Builder):
 
         device_rank = 0 if self.group is None else self.group.rank()
         unbatchable = _has_unbatchable_cache(self.inference_model)
+        batch_head = None
         if engine_mode is None:
             will_draft = _mtp_would_engage(self.inference_model, self.model_id)
             sequential = bool(os.environ.get("EXO_NO_BATCH")) or unbatchable or will_draft
@@ -177,7 +187,18 @@ class MlxBuilder(Builder):
                 raise ValueError(f"unknown engine_mode {engine_mode!r}")
             # An unbatchable cache layout is a hard refusal, not a preference.
             sequential = engine_mode == "sequential" or unbatchable
-            will_draft = sequential and self.mtp_available()
+            will_draft = False
+            if self.mtp_available():
+                if sequential:
+                    will_draft = True
+                elif self._single_node():
+                    # The batch engine drafts too (mtp/batch_loop.py), on
+                    # single-node instances: the head loads once and is
+                    # shared with the sequential path's cache.
+                    from exo.worker.engines.mlx.mtp.speculative import load_batch_head
+
+                    batch_head = load_batch_head(self.inference_model, self.model_id)
+                    will_draft = batch_head is not None
             set_mtp_runtime(will_draft)
             reason = (
                 "chunked KV cache; batch engine disabled"
@@ -213,6 +234,7 @@ class MlxBuilder(Builder):
                 cancel_receiver=self.cancel_receiver,
                 event_sender=self.event_sender,
                 vision_processor=vision_processor,
+                mtp_head=batch_head,
             )
         # Read by the runner's engine-mode switch (runner/engine_mode.py).
         engine.engine_mode = "sequential" if sequential else "batch"  # type: ignore[attr-defined]

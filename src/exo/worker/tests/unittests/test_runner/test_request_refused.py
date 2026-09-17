@@ -59,7 +59,8 @@ def _check(events):
 def test_batch_engine_refuses_the_request_and_keeps_serving(patch_out_mlx, monkeypatch):  # noqa: F811
     monkeypatch.delenv("EXO_NO_BATCH", raising=False)
     _refusing_template(monkeypatch)
-    _check(_run([INIT_TASK, LOAD_TASK, WARMUP_TASK, BAD_TASK, CHAT_TASK, SHUTDOWN_TASK]))
+    _check(_run([INIT_TASK, LOAD_TASK, WARMUP_TASK, BAD_TASK, CHAT_TASK],
+                send_after_ready=[SHUTDOWN_TASK]))
 
 
 def test_sequential_engine_refuses_the_request_and_keeps_serving(patch_out_mlx, monkeypatch):  # noqa: F811
@@ -72,4 +73,9 @@ def test_sequential_engine_refuses_the_request_and_keeps_serving(patch_out_mlx, 
     def fake_generate(**_kw):
         yield GenerationResponse(text="hi", token=0, finish_reason="stop", usage=None)
     monkeypatch.setattr(mlx_batch_generator, "mlx_generate", fake_generate)
-    _check(_run([INIT_TASK, LOAD_TASK, WARMUP_TASK, BAD_TASK, CHAT_TASK, SHUTDOWN_TASK]))
+    # Shutdown goes in only once the runner is back to Ready: a Shutdown the
+    # runner picks up mid-generation abandons the active task (the sequential
+    # engine reports a finished task one step AFTER its last token), which is
+    # exo's shutdown semantics, not what this test is about.
+    _check(_run([INIT_TASK, LOAD_TASK, WARMUP_TASK, BAD_TASK, CHAT_TASK],
+                send_after_ready=[SHUTDOWN_TASK]))

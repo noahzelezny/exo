@@ -123,7 +123,16 @@ class MockLoadOutput:
 
 
 @pytest.fixture
-def patch_out_mlx(monkeypatch: pytest.MonkeyPatch):
+def patch_out_mlx(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    # The runner's engine-mode switch reads the OPERATOR's ~/.exo/engine-mode
+    # and stamps a process-wide drafting override when it rebuilds; point it
+    # at an absent file so a dev box with `auto` in that file does not flip
+    # engines mid-test, and let monkeypatch put the override back afterwards
+    # (it leaked into the MTP gate tests that consult EXO_MTP).
+    from exo.worker.engines.mlx.mtp import speculative
+
+    monkeypatch.setenv("EXO_ENGINE_MODE_FILE", str(tmp_path / "engine-mode"))
+    monkeypatch.setattr(speculative, "_RUNTIME_MTP", None)
     # initialize_mlx returns a mock group
     monkeypatch.setattr(mlx_builder, "initialize_mlx", make_nothin(MockGroup()))
 

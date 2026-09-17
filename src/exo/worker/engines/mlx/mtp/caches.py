@@ -28,7 +28,17 @@ import mlx.core as mx
 
 
 def is_attention(c) -> bool:
-    return hasattr(c, "keys") and hasattr(c, "trim")
+    return hasattr(c, "keys") and hasattr(c, "trim") and not is_batch_attention(c)
+
+
+def is_batch_attention(c) -> bool:
+    """mlx-lm's BatchKVCache (and qwen4_exp's _BatchAttnCache over it): keys
+    and a `trim`, but `offset` is one position PER ROW. Every row of a
+    batched speculative step advances by the same count, so the rollback
+    unit is the shared write index (`size()`), not a per-row offset —
+    `trim(n)` there moves every row's offset together."""
+    return (hasattr(c, "keys") and hasattr(c, "trim")
+            and isinstance(getattr(c, "offset", None), mx.array))
 
 
 def is_attention_composite(c) -> bool:
@@ -48,6 +58,8 @@ def snapshot(caches, *, copy: bool = True) -> list:
     for c in caches:
         if is_attention(c):
             snaps.append(("attn", c.offset, None))
+        elif is_batch_attention(c):
+            snaps.append(("battn", c.size(), None))
         elif is_attention_composite(c):
             snaps.append(("attn-list", [s.offset for s in c.caches], None))
         elif hasattr(c, "cache"):
@@ -76,6 +88,14 @@ def restore(caches, snaps) -> None:
                 raise RuntimeError(
                     f"attention cache went BACKWARDS since the snapshot "
                     f"({c.offset} < {offset}); rollback would corrupt it")
+        elif kind == "battn":
+            n = c.size() - offset
+            if n > 0:
+                c.trim(n)
+            elif n < 0:
+                raise RuntimeError(
+                    f"batched attention cache went BACKWARDS since the "
+                    f"snapshot ({c.size()} < {offset}); rollback would corrupt it")
         elif kind == "attn-list":
             for sub, off in zip(c.caches, offset):
                 n = sub.offset - off

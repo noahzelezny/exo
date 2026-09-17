@@ -429,11 +429,16 @@ class Runner:
         mode = em.read_mode()
         if mode is None:
             return False
+        mtp_available = bool(builder.mtp_available())  # type: ignore[attr-defined]
         target = em.resolve_target(
             mode,
             waiting=waiting,
-            mtp_available=bool(builder.mtp_available()),  # type: ignore[attr-defined]
+            mtp_available=mtp_available,
             current=self._engine_mode,  # type: ignore[arg-type]
+            # MlxBuilder: the batch engine drafts on single-node instances.
+            # A sharded instance's batch engine cannot, so the flip to
+            # sequential stays for it; foreign builders never draft there.
+            batch_drafts=bool(getattr(builder, "batch_drafts", lambda: False)()),
         )
         if target is None:
             return False
