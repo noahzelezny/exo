@@ -57,6 +57,8 @@ from .sampling import Distribution, rejection_correct
 __all__ = ["RowParams", "Row", "Emitted", "RowStep", "MTPBatch", "admit",
            "default_draft_max_rows"]
 
+import time
+
 
 def default_draft_max_rows() -> int | None:
     """A fixed row ceiling for drafting from EXO_MTP_BATCH_MAX_ROWS, or None
@@ -70,23 +72,10 @@ def default_draft_max_rows() -> int | None:
         return None
 
 
-def default_min_accept_prob() -> float:
-    """The adaptive rule's floor: draft while acceptance**rows stays above it.
-
-    The whole-batch replay costs a forward whenever ANY row rejects, so per
-    step drafting spends 1 + (1 - a**B) forwards for 2B tokens against B
-    tokens per forward without it; it pays while a**B clears the extra cost
-    of a 2-wide forward over a 1-wide one. Measured 2026-09-17 on the M3 with
-    Qwen3.8-Flash-Next-VQ-2.1bpw (a ~ 0.75): drafting beat plain batching at
-    1 and 2 rows (23 vs 18, 27-33 vs 25 tok/s) and lost at 3 (32 vs 34),
-    which puts the floor near 0.5 (0.75**2 = 0.56 pays, 0.75**3 = 0.42 does
-    not). The 4.4bpw head accepts ~0.9, so the same floor lets it draft to
-    six rows. EXO_MTP_DRAFT_MIN_ACCEPT overrides.
-    """
-    try:
-        return float(os.environ.get("EXO_MTP_DRAFT_MIN_ACCEPT", "0.5"))
-    except ValueError:
-        return 0.5
+#: steps taken in a regime before its cost estimate counts; and how often
+#: the currently-losing regime is re-tried at the same width.
+EXPLORE_STEPS = 6
+RECHECK_EVERY = 96
 
 
 @dataclass
@@ -243,21 +232,27 @@ class MTPBatch:
 
     def __init__(self, model, head, get_h: Callable[[], mx.array], *,
                  copy_caches: bool, draft_max_rows: int | None = None,
-                 min_accept_prob: float | None = None, acceptance_prior: float = 0.8):
+                 clock: Callable[[], float] = time.perf_counter):
         self.model = model
         self.head = head
         self.get_h = get_h
         self.copy_caches = copy_caches
-        # Fixed ceiling (explicit or EXO_MTP_BATCH_MAX_ROWS) wins; otherwise
-        # the adaptive rule below, seeded with a prior until steps are seen.
+        # A fixed ceiling (explicit or EXO_MTP_BATCH_MAX_ROWS) wins; otherwise
+        # the regime is chosen by MEASURED cost per committed token, per row
+        # count (see drafting_pays). The unknown is not acceptance alone but
+        # how much more a 2-wide forward costs than a 1-wide one at each
+        # width -- on the M4 with Qwen3.8-Flash-Next-VQ-4.4bpw the ratio is
+        # ~1.5 at one row, so only a timing can decide.
         self.draft_max_rows = (
             draft_max_rows if draft_max_rows is not None else default_draft_max_rows()
         )
-        self.min_accept_prob = (
-            min_accept_prob if min_accept_prob is not None else default_min_accept_prob()
-        )
-        self.acc_est = acceptance_prior     # EMA of per-step acceptance
+        self._clock = clock
+        self.acc_est = 0.8                   # EMA of the head's hit rate (logging)
+        # (rows, drafting) -> (EMA seconds per token, steps measured)
+        self._cost: dict = {}
         self._regime: Optional[bool] = None  # last step drafted? (for the log)
+        self._since_recheck = 0
+        self._explore: Optional[tuple] = None   # (rows, drafting, steps left)
 
         self.uids: List[int] = []
         self.params: List[RowParams] = []
@@ -280,21 +275,59 @@ class MTPBatch:
         return self.head is not None and any(self.drafts)
 
     def drafting_pays(self, rows: int) -> bool:
-        """Draft this step, or take a plain one-token step?"""
+        """Draft this step, or take a plain one-token step?
+
+        With no fixed ceiling: each regime's cost per committed token is
+        timed at this row count; an unmeasured regime is tried for
+        EXPLORE_STEPS steps, the cheaper one is taken, and the loser is
+        re-tried every RECHECK_EVERY steps so a head whose acceptance shifts
+        with the text (or a batch whose width changed) is not stuck.
+        """
         if self.head is None:
             return False
         if self.draft_max_rows is not None:
             return rows <= self.draft_max_rows
-        return self.acc_est ** rows >= self.min_accept_prob
+        ex = self._explore
+        if ex is not None and ex[0] == rows and ex[2] > 0:
+            return ex[1]
+        self._explore = None
+        d = self._cost.get((rows, True))
+        p = self._cost.get((rows, False))
+        if d is None or d[1] < EXPLORE_STEPS:
+            self._explore = (rows, True, EXPLORE_STEPS)
+            return True
+        if p is None or p[1] < EXPLORE_STEPS:
+            self._explore = (rows, False, EXPLORE_STEPS)
+            return False
+        best = d[0] <= p[0]
+        if self._since_recheck >= RECHECK_EVERY:
+            self._since_recheck = 0
+            self._explore = (rows, not best, EXPLORE_STEPS)
+            return not best
+        return best
+
+    def _record_cost(self, rows: int, drafting: bool, seconds: float, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        per_tok = seconds / tokens
+        ema, n = self._cost.get((rows, drafting), (per_tok, 0))
+        self._cost[(rows, drafting)] = (0.8 * ema + 0.2 * per_tok, n + 1)
+        self._since_recheck += 1
+        ex = self._explore
+        if ex is not None and ex[0] == rows and ex[1] == drafting:
+            self._explore = (rows, drafting, ex[2] - 1)
 
     def _note_regime(self, drafting: bool, rows: int) -> None:
         if drafting != self._regime:
             self._regime = drafting
             from exo.worker.runner.bootstrap import logger
 
+            d = self._cost.get((rows, True))
+            p = self._cost.get((rows, False))
+            fmt = lambda c: f"{c[0] * 1000:.1f}ms/tok" if c else "unmeasured"
             logger.info(
                 f"MTP batch {'drafting' if drafting else 'plain steps'} at {rows} rows "
-                f"(acceptance est {self.acc_est:.2f}, floor {self.min_accept_prob})"
+                f"(draft {fmt(d)}, plain {fmt(p)}, acceptance est {self.acc_est:.2f})"
             )
 
     # ------------------------------------------------------------ membership
@@ -382,10 +415,17 @@ class MTPBatch:
         if B == 0:
             return []
         assert self.t1 is not None and self.row_t1 is not None
-        if not self.drafting_pays(B):
-            self._note_regime(False, B)
-            return self._plain_step()
-        self._note_regime(True, B)
+        drafting = self.drafting_pays(B)
+        self._note_regime(drafting, B)
+        t0 = self._clock()
+        out = self._plain_step() if not drafting else self._draft_step(B)
+        self._record_cost(B, drafting, self._clock() - t0,
+                          sum(len(rs.tokens) for rs in out))
+        return out
+
+    def _draft_step(self, B: int) -> List[RowStep]:
+        """One speculative step: every row commits t1 and a verified t2."""
+        assert self.t1 is not None and self.row_t1 is not None
 
         # A row drafts this step iff it is a drafting row AND the head has
         # produced a draft for it (the batch may hold only non-drafting rows).
@@ -529,6 +569,10 @@ class MTPBatch:
         assert self.t1 is not None and self.row_t1 is not None
         lg = self.model(self.t1[:, None], cache=self.cache)     # [B, 1, V]
         t1_list = self.t1.tolist()
+        # The head already drafted the token after t1 (draft_row); the trunk
+        # is about to choose it too, so score the head at no cost and keep
+        # the acceptance estimate live while not drafting.
+        standing = self.draft_row if self.any_drafting else None
         out: List[RowStep] = []
         keep: List[int] = []
         for i in range(B):
@@ -554,6 +598,10 @@ class MTPBatch:
         t_next_rows = [
             _pick(row_t1[i:i + 1], self.params[i], self.emitted[i]) for i in keep
         ]
+        if standing is not None and keep:
+            hits = mx.argmax(standing, axis=-1)[mx.array(keep)] == mx.concatenate(t_next_rows)
+            frac = float(mx.mean(hits.astype(mx.float32)).item())
+            self.acc_est = 0.9 * self.acc_est + 0.1 * frac
         self.filter(keep)
         if not keep:
             return out

@@ -64,6 +64,20 @@ def test_resolve_target_when_the_batch_engine_drafts(mode, waiting, current, wan
                              batch_drafts=True) == want
 
 
+def test_a_launch_built_batch_engine_without_a_head_is_rebuilt_once():
+    # EXO_MTP unset at launch -> plain BatchGenerator; the first boundary under
+    # auto/batch must rebuild it WITH the head (seen live on the M4 2026-09-17:
+    # auto said "batch, stay" and the probe measured plain batching).
+    kw = dict(waiting=0, mtp_available=True, current="batch", batch_drafts=True)
+    assert em.resolve_target("auto", current_drafts=False, **kw) == "batch"
+    assert em.resolve_target("batch", current_drafts=False, **kw) == "batch"
+    assert em.resolve_target("auto", current_drafts=True, **kw) is None
+    # ...and where the batch engine cannot draft (sharded), auto keeps the
+    # old flip to sequential for a lone request
+    assert em.resolve_target("auto", waiting=0, mtp_available=True, current="batch",
+                             batch_drafts=False, current_drafts=False) == "sequential"
+
+
 def test_read_mode_file(tmp_path, monkeypatch):
     f = tmp_path / "engine-mode"
     monkeypatch.setenv("EXO_ENGINE_MODE_FILE", str(f))

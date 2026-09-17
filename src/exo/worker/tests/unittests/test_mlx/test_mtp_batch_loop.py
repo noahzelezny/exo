@@ -275,24 +275,69 @@ def test_wide_batch_takes_plain_steps_and_drafts_again_when_it_narrows(rig):
     assert batch.hcache is None                      # everything finished
 
 
-def test_adaptive_rule_drafts_while_acceptance_to_the_rows_clears_the_floor():
+def test_regime_follows_the_measured_cost_per_token():
+    from exo.worker.engines.mlx.mtp import batch_loop as bl
+
     trunk = ToyTrunk()
-    head = ToyHead(rule=lambda last: last < 0)   # always right
+    head = ToyHead(rule=lambda last: (last % 3) == 0)
+    # a fake clock: drafting steps "cost" 3 units for 2 tokens (1.5/tok),
+    # plain steps 1 unit for 1 token -> plain should win at this width
+    now = [0.0]
+    b_ref = []
+
+    def clock():
+        return now[0]
+
     with capture_input(trunk.model, "norm") as get_h:
-        b = MTPBatch(trunk, head, get_h, copy_caches=False, min_accept_prob=0.5,
-                     acceptance_prior=0.8)
-        assert b.drafting_pays(1) and b.drafting_pays(3)      # 0.8**3 = 0.51
-        assert not b.drafting_pays(4)                          # 0.8**4 = 0.41
-        b.acc_est = 0.95
-        assert b.drafting_pays(13) and not b.drafting_pays(14)
-        # a fixed ceiling overrides the rule
-        b.draft_max_rows = 2
-        assert b.drafting_pays(2) and not b.drafting_pays(3)
+        b = MTPBatch(trunk, head, get_h, copy_caches=False, clock=clock)
+        b_ref.append(b)
+        orig_draft, orig_plain = b._draft_step, b._plain_step
+
+        def draft(B):
+            now[0] += 3.0
+            return orig_draft(B)
+
+        def plain():
+            now[0] += 1.0
+            return orig_plain()
+
+        b._draft_step, b._plain_step = draft, plain
+        b.extend([admit(trunk, head, get_h, mx.array([1, 2]), _params(400),
+                        uid=0, make_draft_cache=KVCache, prefill_step_size=3)])
+        regimes = []
+        for _ in range(bl.EXPLORE_STEPS * 2 + 20):
+            regimes.append(b.drafting_pays(1))
+            b.step()
+        # explores drafting first, then plain, then settles on plain
+        assert regimes[:bl.EXPLORE_STEPS] == [True] * bl.EXPLORE_STEPS
+        assert regimes[bl.EXPLORE_STEPS:2 * bl.EXPLORE_STEPS] == [False] * bl.EXPLORE_STEPS
+        assert not any(regimes[2 * bl.EXPLORE_STEPS:])
+        # and re-checks the loser within RECHECK_EVERY steps, then settles again
+        later = []
+        for _ in range(bl.RECHECK_EVERY + bl.EXPLORE_STEPS):
+            later.append(b.drafting_pays(1))
+            b.step()
+        assert later.count(True) == bl.EXPLORE_STEPS
+        assert not later[-1]
+    assert b_ref[0]._cost[(1, False)][0] < b_ref[0]._cost[(1, True)][0]
 
 
-def test_acceptance_estimate_tracks_the_head(rig):
+def test_a_fixed_ceiling_overrides_the_measurement(rig):
+    trunk, head, batch, _ = rig
+    batch.draft_max_rows = 2
+    assert batch.drafting_pays(2) and not batch.drafting_pays(3)
+
+
+def test_acceptance_estimate_tracks_the_head_in_both_regimes(rig):
     trunk, head, batch, _ = rig
     batch.extend([_admit(rig, 0, [1, 2, 3], 40)])
     _run(batch, [0])
     # the toy head is wrong on a third of tokens; the EMA settles near 2/3
     assert 0.5 < batch.acc_est < 0.85
+    # plain steps score the standing draft for free: the estimate keeps
+    # moving with no drafting step at all
+    batch.draft_max_rows = 0
+    batch.acc_est = 0.0
+    batch.extend([_admit(rig, 1, [4, 5], 30)])
+    _run(batch, [1])
+    assert batch.acc_est > 0.3

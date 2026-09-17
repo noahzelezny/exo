@@ -439,6 +439,7 @@ class Runner:
             # A sharded instance's batch engine cannot, so the flip to
             # sequential stays for it; foreign builders never draft there.
             batch_drafts=bool(getattr(builder, "batch_drafts", lambda: False)()),
+            current_drafts=bool(getattr(self.generator, "drafting", True)),
         )
         if target is None:
             return False
