@@ -273,3 +273,26 @@ def test_wide_batch_takes_plain_steps_and_drafts_again_when_it_narrows(rig):
     assert got[1] + more[1] == _chain([3, 4, 5], 12)
     assert got[2] + more[2] == _chain([6], 12)
     assert batch.hcache is None                      # everything finished
+
+
+def test_adaptive_rule_drafts_while_acceptance_to_the_rows_clears_the_floor():
+    trunk = ToyTrunk()
+    head = ToyHead(rule=lambda last: last < 0)   # always right
+    with capture_input(trunk.model, "norm") as get_h:
+        b = MTPBatch(trunk, head, get_h, copy_caches=False, min_accept_prob=0.5,
+                     acceptance_prior=0.8)
+        assert b.drafting_pays(1) and b.drafting_pays(3)      # 0.8**3 = 0.51
+        assert not b.drafting_pays(4)                          # 0.8**4 = 0.41
+        b.acc_est = 0.95
+        assert b.drafting_pays(13) and not b.drafting_pays(14)
+        # a fixed ceiling overrides the rule
+        b.draft_max_rows = 2
+        assert b.drafting_pays(2) and not b.drafting_pays(3)
+
+
+def test_acceptance_estimate_tracks_the_head(rig):
+    trunk, head, batch, _ = rig
+    batch.extend([_admit(rig, 0, [1, 2, 3], 40)])
+    _run(batch, [0])
+    # the toy head is wrong on a third of tokens; the EMA settles near 2/3
+    assert 0.5 < batch.acc_est < 0.85

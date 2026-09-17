@@ -58,20 +58,35 @@ __all__ = ["RowParams", "Row", "Emitted", "RowStep", "MTPBatch", "admit",
            "default_draft_max_rows"]
 
 
-def default_draft_max_rows() -> int:
-    """Rows up to which the batch drafts; above it, plain one-token steps.
+def default_draft_max_rows() -> int | None:
+    """A fixed row ceiling for drafting from EXO_MTP_BATCH_MAX_ROWS, or None
+    for the adaptive rule (`MTPBatch.drafting_pays`)."""
+    raw = os.environ.get("EXO_MTP_BATCH_MAX_ROWS")
+    if not raw:
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return None
 
-    The whole-batch replay costs a forward whenever ANY row rejects, so the
-    speculative win decays with rows: measured 2026-09-17 on the M3 with
-    Qwen3.8-Flash-Next-VQ-2.1bpw (acceptance ~0.75), drafting beat plain
-    batching at 1 and 2 rows (23 vs 18, 27-33 vs 25 tok/s aggregate) and lost
-    at 3 (32 vs 34). Override with EXO_MTP_BATCH_MAX_ROWS; a higher-acceptance
-    head earns a higher ceiling — measure, then raise it.
+
+def default_min_accept_prob() -> float:
+    """The adaptive rule's floor: draft while acceptance**rows stays above it.
+
+    The whole-batch replay costs a forward whenever ANY row rejects, so per
+    step drafting spends 1 + (1 - a**B) forwards for 2B tokens against B
+    tokens per forward without it; it pays while a**B clears the extra cost
+    of a 2-wide forward over a 1-wide one. Measured 2026-09-17 on the M3 with
+    Qwen3.8-Flash-Next-VQ-2.1bpw (a ~ 0.75): drafting beat plain batching at
+    1 and 2 rows (23 vs 18, 27-33 vs 25 tok/s) and lost at 3 (32 vs 34),
+    which puts the floor near 0.5 (0.75**2 = 0.56 pays, 0.75**3 = 0.42 does
+    not). The 4.4bpw head accepts ~0.9, so the same floor lets it draft to
+    six rows. EXO_MTP_DRAFT_MIN_ACCEPT overrides.
     """
     try:
-        return max(1, int(os.environ.get("EXO_MTP_BATCH_MAX_ROWS", "2")))
+        return float(os.environ.get("EXO_MTP_DRAFT_MIN_ACCEPT", "0.5"))
     except ValueError:
-        return 2
+        return 0.5
 
 
 @dataclass
@@ -227,14 +242,22 @@ class MTPBatch:
     """
 
     def __init__(self, model, head, get_h: Callable[[], mx.array], *,
-                 copy_caches: bool, draft_max_rows: int | None = None):
+                 copy_caches: bool, draft_max_rows: int | None = None,
+                 min_accept_prob: float | None = None, acceptance_prior: float = 0.8):
         self.model = model
         self.head = head
         self.get_h = get_h
         self.copy_caches = copy_caches
+        # Fixed ceiling (explicit or EXO_MTP_BATCH_MAX_ROWS) wins; otherwise
+        # the adaptive rule below, seeded with a prior until steps are seen.
         self.draft_max_rows = (
             draft_max_rows if draft_max_rows is not None else default_draft_max_rows()
         )
+        self.min_accept_prob = (
+            min_accept_prob if min_accept_prob is not None else default_min_accept_prob()
+        )
+        self.acc_est = acceptance_prior     # EMA of per-step acceptance
+        self._regime: Optional[bool] = None  # last step drafted? (for the log)
 
         self.uids: List[int] = []
         self.params: List[RowParams] = []
@@ -255,6 +278,24 @@ class MTPBatch:
     @property
     def any_drafting(self) -> bool:
         return self.head is not None and any(self.drafts)
+
+    def drafting_pays(self, rows: int) -> bool:
+        """Draft this step, or take a plain one-token step?"""
+        if self.head is None:
+            return False
+        if self.draft_max_rows is not None:
+            return rows <= self.draft_max_rows
+        return self.acc_est ** rows >= self.min_accept_prob
+
+    def _note_regime(self, drafting: bool, rows: int) -> None:
+        if drafting != self._regime:
+            self._regime = drafting
+            from exo.worker.runner.bootstrap import logger
+
+            logger.info(
+                f"MTP batch {'drafting' if drafting else 'plain steps'} at {rows} rows "
+                f"(acceptance est {self.acc_est:.2f}, floor {self.min_accept_prob})"
+            )
 
     # ------------------------------------------------------------ membership
 
@@ -341,8 +382,10 @@ class MTPBatch:
         if B == 0:
             return []
         assert self.t1 is not None and self.row_t1 is not None
-        if B > self.draft_max_rows:
+        if not self.drafting_pays(B):
+            self._note_regime(False, B)
             return self._plain_step()
+        self._note_regime(True, B)
 
         # A row drafts this step iff it is a drafting row AND the head has
         # produced a draft for it (the batch may hold only non-drafting rows).
@@ -403,6 +446,10 @@ class MTPBatch:
         ok_flags = [bool(o.item()) if isinstance(o, mx.array) else bool(o) for o in oks]
         t2 = mx.concatenate(t2_rows).astype(mx.int32)
 
+        n_live = sum(live)
+        if n_live:
+            frac = sum(int(ok_flags[i]) for i in range(B) if live[i]) / n_live
+            self.acc_est = 0.9 * self.acc_est + 0.1 * frac
         for i in range(B):
             if live[i]:
                 self.steps[i] += 1
