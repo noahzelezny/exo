@@ -36,23 +36,24 @@ def _cache_state(cache: Any) -> List[mx.array]:
 
 
 def seed_head(head: Any, h_chunks: List[mx.array], ids: mx.array, n: int,
-              cache: Any, step: int) -> None:
-    """Advance `head` over positions 0..n-2 -- input (h_t, x_{t+1}) -- in
+              cache: Any, step: int, start: int = 0) -> None:
+    """Advance `head` over positions start..n-2 -- input (h_t, x_{t+1}) -- in
     chunks of at most `step` positions.
 
-    `h_chunks` are the captured trunk hidden states, in order, covering at
-    least positions 0..n-2 (the caller may append the final position's
-    capture; the extra is ignored). `ids` is [B, >= n]. The head's cache
-    carries the offset, so each chunk sees exactly the mask the trunk would
+    `h_chunks` are the captured trunk hidden states, in order, starting at
+    position `start` and covering at least positions start..n-2 (the caller
+    may append the final position's capture; the extra is ignored). `ids` is
+    [B, >= n]. The head's cache carries the offset (== start on entry, the
+    prefix-pool case), so each chunk sees exactly the mask the trunk would
     have built for the same positions.
     """
-    if n < 2:
+    if n - start < 2:
         return
     step = max(1, int(step))
     h_all = mx.concatenate(h_chunks, axis=1) if len(h_chunks) > 1 else h_chunks[0]
-    for i in range(0, n - 1, step):
+    for i in range(start, n - 1, step):
         j = min(i + step, n - 1)
-        head.advance(h_all[:, i:j], ids[:, 1 + i:1 + j], cache)
+        head.advance(h_all[:, i - start:j - start], ids[:, 1 + i:1 + j], cache)
         mx.eval(_cache_state(cache))
         mx.clear_cache()
     del h_all

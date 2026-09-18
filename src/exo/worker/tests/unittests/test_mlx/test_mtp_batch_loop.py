@@ -129,9 +129,10 @@ def rig():
 
 def _admit(rig, uid, prompt, max_tokens, **kw):
     trunk, head, batch, get_h = rig
+    restore = {k: kw.pop(k) for k in ("cache", "hcache", "start_pos") if k in kw}
     return admit(
         trunk, head, get_h, mx.array(prompt), _params(max_tokens, **kw),
-        uid=uid, make_draft_cache=KVCache, prefill_step_size=3,
+        uid=uid, make_draft_cache=KVCache, prefill_step_size=3, **restore,
     )
 
 
@@ -363,3 +364,69 @@ def test_the_head_is_seeded_in_prefill_sized_chunks(rig):
     got, _ = _run(batch, [0])
     want = _chain(prompt, 6)
     assert got[0] == want
+
+
+# ── prefix reuse: the head cache travels with the trunk's ──────────────────
+
+def _restored(row):
+    """What the KV prefix pool hands back for an exact hit on this row's
+    prompt: deep copies of its trunk and head caches, both at the prompt
+    length (the pool trims them together)."""
+    import copy
+    return copy.deepcopy(row.cache), copy.deepcopy(row.hcache)
+
+
+def test_admit_from_a_prefix_prefills_only_the_suffix(rig):
+    trunk, head, batch, get_h = rig
+    base = [1, 5, 9, 2, 8, 3, 7, 4, 6, 10, 11, 12]
+    first = _admit(rig, 0, base, 2)
+    assert int(first.hcache.offset) == len(base)
+    cache, hcache = _restored(first)
+    longer = base + [13, 14, 15, 16]
+    trunk.forwards.clear()
+    head.seeds.clear()
+    row = _admit(rig, 1, longer, 6, cache=cache, hcache=hcache, start_pos=len(base))
+    # trunk: one chunk over positions 12..14 (step 3) + the final token forward
+    assert trunk.forwards == [(1, 3), (1, 1)], trunk.forwards
+    # head: seeded over positions 12..14 only, and lands at P == 16
+    assert head.seeds == [3], head.seeds
+    assert int(row.hcache.offset) == len(longer)
+    assert int(row.cache[0].offset) == len(longer)
+    batch.extend([row])
+    got, _ = _run(batch, [1])
+    assert got[1] == _chain(longer, 6)
+
+
+def test_admit_refuses_a_head_cache_that_is_not_at_the_prefix(rig):
+    trunk, head, batch, get_h = rig
+    base = [1, 5, 9, 2, 8, 3, 7, 4, 6, 10, 11, 12]
+    first = _admit(rig, 0, base, 2)
+    cache, hcache = _restored(first)
+    hcache.offset = len(base) - 1  # a head that stopped one position short
+    with pytest.raises(ValueError):
+        _admit(rig, 1, base + [13, 14], 2, cache=cache, hcache=hcache, start_pos=len(base))
+
+
+def test_split_pool_entry_rules():
+    from exo.worker.engines.mlx.generator.mtp_batch_generate import split_pool_entry
+
+    class C:
+        def __init__(self, offset):
+            self.offset = offset
+
+    t = [C(12), C(12)]
+    # drafting row, entry carries an aligned head -> use both
+    trunk, h, n = split_pool_entry(t + [C(12)], 2, drafts=True, hit_len=12)
+    assert trunk == t and h is not None and n == 12
+    # drafting row, trunk-only entry (stored by a vision row) -> unusable
+    trunk, h, n = split_pool_entry(list(t), 2, drafts=True, hit_len=12)
+    assert (trunk, h, n) == ([], None, 0)
+    # drafting row, head at the wrong offset -> unusable
+    trunk, h, n = split_pool_entry(t + [C(7)], 2, drafts=True, hit_len=12)
+    assert (trunk, h, n) == ([], None, 0)
+    # non-drafting row uses the trunk part of any entry
+    trunk, h, n = split_pool_entry(t + [C(12)], 2, drafts=False, hit_len=12)
+    assert trunk == t and h is None and n == 12
+    # miss
+    trunk, h, n = split_pool_entry(list(t), 2, drafts=True, hit_len=0)
+    assert h is None and n == 0

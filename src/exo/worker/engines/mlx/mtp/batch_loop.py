@@ -150,9 +150,24 @@ def admit(
     prefill_step_size: int = 2048,
     prefill_ctx=None,
     on_progress: Optional[Callable[[int, int], None]] = None,
+    cache: Optional[list] = None,
+    hcache: Any = None,
+    start_pos: int = 0,
+    on_chunk: Optional[Callable[[list, Any], None]] = None,
 ) -> Row:
     """Prefill one prompt and seed the head for it: loop.py's prefill, kept
     as a standalone so the batch can admit rows between steps.
+
+    Prefix reuse: `cache` (trunk) and `hcache` (head) may arrive from the KV
+    prefix pool already holding positions 0..start_pos-1, both at offset
+    start_pos -- the head's cache is stored in the pool beside the trunk's
+    and trimmed with it, so it stays one row per committed token. Only
+    ids[start_pos:] is prefilled and the head is seeded over
+    start_pos..P-2. A drafting row whose head cache is NOT at start_pos
+    cannot be admitted from that prefix (the head would draft off the
+    wrong history); the caller falls back to a fresh prefill. `on_chunk`
+    is called with (cache, hcache) after every prefill chunk so the caller
+    can snapshot recurrent state for the pool.
 
     `prefill_ctx` (a zero-arg context-manager factory) wraps the chunked
     prompt forwards only — a vision request's embedding patch goes there,
@@ -168,14 +183,23 @@ def admit(
     if ids.ndim == 1:
         ids = ids[None]
     n = int(ids.shape[1])
-    cache = model.make_cache()
+    start_pos = max(0, int(start_pos))
+    if cache is None:
+        cache = model.make_cache()
+        start_pos = 0
     drafts = params.drafts and head is not None
-    dcache = make_draft_cache()
+    dcache = hcache if hcache is not None else make_draft_cache()
+    if drafts and start_pos > 0:
+        hoff = int(getattr(dcache, "offset", 0) or 0)
+        if hoff != start_pos:
+            raise ValueError(
+                f"head cache at offset {hoff} cannot seed a prefix at {start_pos}"
+            )
 
     h_chunks: List[mx.array] = []
     ctx = prefill_ctx() if prefill_ctx is not None else contextlib.nullcontext()
     with ctx:
-        for i in range(0, n - 1, prefill_step_size):
+        for i in range(start_pos, n - 1, prefill_step_size):
             end = min(i + prefill_step_size, n - 1)
             chunk = ids[:, i:end]
             if not chunk.shape[1]:
@@ -191,6 +215,8 @@ def admit(
                 want.append(h)
             mx.eval(want)
             mx.clear_cache()
+            if on_chunk is not None:
+                on_chunk(cache, dcache)
             if on_progress is not None:
                 on_progress(end, n)
 
@@ -207,7 +233,7 @@ def admit(
         # history and cache.offset == P-1 == the true position. Chunked like
         # the trunk's prefill: one call over the whole prompt is quadratic
         # on an attention head (see seed.py).
-        seed_head(head, h_chunks, ids, n, dcache, prefill_step_size)
+        seed_head(head, h_chunks, ids, n, dcache, prefill_step_size, start=start_pos)
         h_chunks.clear()
         mx.clear_cache()
         # Bootstrap draft at position P-1: input (h_{P-1}, x_P).

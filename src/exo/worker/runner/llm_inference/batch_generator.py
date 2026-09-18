@@ -395,6 +395,7 @@ class BatchGenerator(Engine):
                 tokenizer=self.tokenizer,
                 head=self.mtp_head,
                 vision_processor=self.vision_processor,
+                kv_prefix_cache=self.kv_prefix_cache,
             )
         else:
             self._gen = ExoBatchGenerator(
