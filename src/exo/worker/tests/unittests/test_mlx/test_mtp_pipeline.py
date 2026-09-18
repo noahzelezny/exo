@@ -136,8 +136,11 @@ class ToyHead:
     def __init__(self, accepts: list[bool]) -> None:
         self.accepts = accepts
         self.calls = 0
+        self.seeds: list[int] = []  # positions per advance() call
 
     def advance(self, h, ids, cache) -> None:  # noqa: ANN001
+        assert h.shape[1] == ids.shape[1], "hidden/ids chunks must align"
+        self.seeds.append(int(ids.shape[1]))
         cache.offset += int(ids.shape[1])
 
     def draft_logits(self, h, ids, cache):  # noqa: ANN001
@@ -619,3 +622,23 @@ def test_gate_is_off_without_the_env_var(monkeypatch):
 def test_gate_falls_back_when_the_head_will_not_load(monkeypatch):
     spec = _patch_head_load(monkeypatch, head=None)
     assert spec.plan_mtp(_plain_model(), "m", None, has_vision=False) is None
+
+
+def test_single_node_seeds_the_head_in_prefill_sized_chunks():
+    """Same rule as the batched loop (test_mtp_batch_loop): the head is seeded
+    over positions 0..P-2 in chunks no larger than prefill_step_size, never in
+    one call over the whole prompt (quadratic on an attention head)."""
+    model = ToyModel(8)
+    head = ToyHead([True] * 32)
+    prompt = list(range(1, 21))
+    toks = []
+    for r in mtp_stream_generate(
+        model, ToyTokenizer(), prompt, head, family=FAMILY,
+        max_tokens=4, temp=0.0, prompt_cache=model.make_cache(),
+        prefill_step_size=3,
+    ):
+        if not r.tail:
+            toks.append(r.token)
+    assert head.seeds and max(head.seeds) <= 3, head.seeds
+    assert sum(head.seeds) == len(prompt) - 1, head.seeds
+    assert len(toks) == 4

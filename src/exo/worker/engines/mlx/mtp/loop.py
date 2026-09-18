@@ -83,6 +83,7 @@ from .capture import capture_input
 from .caches import restore, snapshot
 from .pipeline import Coordinator, LocalCoordinator
 from .sampling import Distribution, make_distribution, rejection_correct
+from .seed import seed_head as _seed_head_chunked
 
 __all__ = ["MTPResponse", "load_mtp_head", "mtp_generate", "mtp_stream_generate"]
 
@@ -351,10 +352,10 @@ def mtp_stream_generate(
             # history the trunk has, and with cache.offset == P-1. Position
             # P-1 is not seeded: its input needs x_P, the first sampled
             # token, and it is the bootstrap draft below.
-            if n >= 2:
-                h_all = mx.concatenate(h_chunks, axis=1)
-                head.advance(h_all[:, :n - 1], ids[:, 1:n], dcache)
-                del h_all
+            # Chunked like the prefill above: seeding the head in ONE call
+            # over the whole prompt is quadratic on an attention head and
+            # wedged 120k-token reads on Flash-Next (see seed.py).
+            _seed_head_chunked(head, h_chunks, ids, n, dcache, prefill_step_size)
             h_chunks.clear()
             mx.clear_cache()
             # Bootstrap draft: position P-1, input (h_{P-1}, x_P).

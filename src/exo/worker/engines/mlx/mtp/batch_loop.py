@@ -52,6 +52,7 @@ import mlx.core as mx
 from mlx_lm.generate import _extend_cache, _merge_caches
 
 from .caches import restore, snapshot
+from .seed import seed_head
 from .sampling import Distribution, rejection_correct
 
 __all__ = ["RowParams", "Row", "Emitted", "RowStep", "MTPBatch", "admit",
@@ -202,12 +203,11 @@ def admit(
         h_chunks.append(get_h())
         h_last = h_chunks[-1][:, -1:]
         mx.eval(t1, h_last)
-        if n >= 2:
-            # Positions 0..P-2, so the head enters decoding with the trunk's
-            # history and cache.offset == P-1 == the true position.
-            h_all = mx.concatenate(h_chunks, axis=1)
-            head.advance(h_all[:, : n - 1], ids[:, 1:n], dcache)
-            del h_all
+        # Positions 0..P-2, so the head enters decoding with the trunk's
+        # history and cache.offset == P-1 == the true position. Chunked like
+        # the trunk's prefill: one call over the whole prompt is quadratic
+        # on an attention head (see seed.py).
+        seed_head(head, h_chunks, ids, n, dcache, prefill_step_size)
         h_chunks.clear()
         mx.clear_cache()
         # Bootstrap draft at position P-1: input (h_{P-1}, x_P).

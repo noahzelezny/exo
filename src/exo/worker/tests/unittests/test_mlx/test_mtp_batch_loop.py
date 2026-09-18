@@ -84,12 +84,15 @@ class ToyHead:
     def __init__(self, rule):
         self.rule = rule
         self.calls = 0
+        self.seeds: list[int] = []  # positions per advance() call
 
     def _kv(self, ids):
         B, T = ids.shape
         return mx.zeros((B, 1, T, 1))
 
     def advance(self, h, ids, cache):
+        assert h.shape[1] == ids.shape[1], "hidden/ids chunks must align"
+        self.seeds.append(int(ids.shape[1]))
         cache.update_and_fetch(self._kv(ids), self._kv(ids))
 
     def draft_logits(self, h, ids, cache):
@@ -341,3 +344,22 @@ def test_acceptance_estimate_tracks_the_head_in_both_regimes(rig):
     batch.extend([_admit(rig, 1, [4, 5], 30)])
     _run(batch, [1])
     assert batch.acc_est > 0.3
+
+
+def test_the_head_is_seeded_in_prefill_sized_chunks(rig):
+    """One advance() over the whole prompt is quadratic on an attention head
+    (Flash-Next's indexer: ~6 B x S^2 of temporaries, ~86 GB at 120k tokens,
+    which wedged delegate_read three times on 2026-09-17). The seed must be
+    chunked like the trunk's prefill, and still cover exactly positions
+    0..P-2 so the head's offset lands on P-1."""
+    trunk, head, batch, get_h = rig
+    prompt = [1, 5, 9, 2, 8, 3, 7, 4, 6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    row = _admit(rig, 0, prompt, 6)
+    assert head.seeds, "the head was never seeded"
+    assert max(head.seeds) <= 3, head.seeds            # prefill_step_size=3
+    assert sum(head.seeds) == len(prompt) - 1, head.seeds
+    assert int(row.hcache.offset) == len(prompt)        # P-1 seeded + bootstrap
+    batch.extend([row])
+    got, _ = _run(batch, [0])
+    want = _chain(prompt, 6)
+    assert got[0] == want
